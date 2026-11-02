@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Portions of src/subs.rs are derived from zen-gate's internal/subs/parse.go:
-MIT License, Copyright (c) 2026 LAGcomcom.
-
-The bottom dock in assets/index.html takes its visual and interaction
-parameters from workbuddy-manager's web/components/ui/floating-dock.tsx:
-MIT License, Copyright (c) 2026 WorkBuddy Manager contributors.

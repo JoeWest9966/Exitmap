@@ -95,8 +95,17 @@ net.ipv4.ip_local_reserved_ports = 18788-18799,21001-21300,31001-31128,32001-324
 
 即便如此，仍可能有进程先占住某个端口，所以 exitmap 每轮会先试探每个端口能否 bind，**被占的那个节点这一轮直接跳过**，不会拖垮整张表。
 
+## 安全边界
+
+面板**没有鉴权**：能看出口表、能增删订阅（URL 回显只露 `?key=***`），只是靠下面两层挡着：
+
+1. `listen` 默认只绑 `127.0.0.1`；要远程访问才加上 Tailscale 之类的私有地址（不要绑 `0.0.0.0`）；
+2. 防火墙只放行该网段（例如 `ufw allow from 100.64.0.0/10 to any port 18790 proto tcp`）。
+
+**不要把它暴露到公网。** 出口端口是无认证的 socks5/http 代理，谁连上谁的流量就从你的机场出口走。
+
 ## 版权
 
-底部 dock 的视觉与交互参数取自 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) 的 `web/components/ui/floating-dock.tsx`，MIT，Copyright (c) 2026 WorkBuddy Manager contributors；`assets/index.html` 里是用原生 JS 重写的版本，没有引入 React 或 motion。
+完整的第三方声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。底部 dock 的视觉与交互参数取自 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) 的 `web/components/ui/floating-dock.tsx`，MIT，Copyright (c) 2026 WorkBuddy Manager contributors；`assets/index.html` 里是用原生 JS 重写的版本，没有引入 React 或 motion。
 
 `src/subs.rs`（节点 URI 解析）移植自 [zen-gate](https://github.com/LAGcomcom/zen-gate) 的 `internal/subs/parse.go`，MIT，Copyright (c) 2026 LAGcomcom。那些解析上的坑（`*_auto` uTLS 别名、`fp=unsafe` 会让整份配置被 sing-box 拒掉、ss 的三种 base64 形状）是真金白银换来的，所以是移植而不是重写。
