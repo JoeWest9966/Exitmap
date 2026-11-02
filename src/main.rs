@@ -149,6 +149,16 @@ fn save_config(cfg: &Config) -> Result<()> {
 
 // ── runtime state ─────────────────────────────────────────────────────────────
 
+/// One subscription's last fetch outcome, so the panel can show which feed is
+/// actually contributing instead of an undifferentiated sum.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubStat {
+    id: String,
+    nodes: usize,
+    error: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Status {
@@ -176,6 +186,7 @@ struct Inner {
     /// node id -> last good (egress ip, latency). Lets a node that missed one
     /// probe keep its exit instead of triggering a rebind.
     node_last: HashMap<String, (String, u64)>,
+    sub_stats: Vec<SubStat>,
 }
 
 struct App {
@@ -284,24 +295,50 @@ impl App {
         Ok(())
     }
 
-    async fn fetch_all(&self, cfg: &Config) -> Result<Vec<subs::Node>> {
+    async fn fetch_all(&self, cfg: &Config) -> Result<(Vec<subs::Node>, Vec<SubStat>)> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(45))
             .build()?;
         let mut nodes: Vec<subs::Node> = Vec::new();
         let mut errs: Vec<String> = Vec::new();
-        for s in cfg.subscriptions.iter().filter(|s| s.enabled) {
+        let mut stats: Vec<SubStat> = Vec::new();
+        for s in cfg.subscriptions.iter() {
+            if !s.enabled {
+                stats.push(SubStat {
+                    id: s.id.clone(),
+                    nodes: 0,
+                    error: "已停用".into(),
+                });
+                continue;
+            }
             match subs::fetch(&client, &s.url).await {
                 Ok(body) => {
                     let parsed = subs::parse_body(&body);
                     if parsed.is_empty() {
                         errs.push(format!("{}: 解析不出节点", s.name));
+                        stats.push(SubStat {
+                            id: s.id.clone(),
+                            nodes: 0,
+                            error: "解析不出节点".into(),
+                        });
                     } else {
                         eprintln!("[exitmap] 订阅 {} -> {} 个节点", s.name, parsed.len());
+                        stats.push(SubStat {
+                            id: s.id.clone(),
+                            nodes: parsed.len(),
+                            error: String::new(),
+                        });
                         nodes.extend(parsed);
                     }
                 }
-                Err(e) => errs.push(format!("{}: {e}", s.name)),
+                Err(e) => {
+                    errs.push(format!("{}: {e}", s.name));
+                    stats.push(SubStat {
+                        id: s.id.clone(),
+                        nodes: 0,
+                        error: e.to_string(),
+                    });
+                }
             }
         }
         // Dedupe across subscriptions: the same node in two feeds is one exit.
@@ -316,7 +353,7 @@ impl App {
         if errs.len() > 0 {
             eprintln!("[exitmap] 部分订阅失败: {}", errs.join("; "));
         }
-        Ok(nodes)
+        Ok((nodes, stats))
     }
 
     /// Country codes for IPs we have never seen. ip-api.com's free tier allows
@@ -370,7 +407,7 @@ impl App {
             || now - last_sub >= cfg.sub_fetch_minutes as i64 * 60_000;
         if sub_due {
             match self.fetch_all(&cfg).await {
-                Ok(mut nodes) => {
+                Ok((mut nodes, stats)) => {
                     if cfg.max_probe_nodes > 0 && nodes.len() > cfg.max_probe_nodes {
                         // Round-robin the cut so no node is permanently ignored.
                         let off = (now / 60_000) as usize % nodes.len();
@@ -381,6 +418,7 @@ impl App {
                     {
                         let mut inner = self.inner.write().await;
                         inner.nodes = nodes;
+                        inner.sub_stats = stats;
                         inner.status.last_sub_fetch_ms = now;
                         inner.status.nodes = n;
                     }
@@ -622,11 +660,14 @@ async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
         .subscriptions
         .iter()
         .map(|s| {
+            let st = inner.sub_stats.iter().find(|x| x.id == s.id);
             json!({
                 "id": s.id,
                 "name": s.name,
                 "urlMasked": mask_url(&s.url),
                 "enabled": s.enabled,
+                "nodes": st.map(|x| x.nodes).unwrap_or(0),
+                "error": st.map(|x| x.error.clone()).unwrap_or_default(),
             })
         })
         .collect();
@@ -1011,6 +1052,7 @@ async fn main() -> Result<()> {
             },
             node_fails: HashMap::new(),
             node_last: HashMap::new(),
+            sub_stats: Vec::new(),
         }),
         sidecar: Mutex::new(singbox::Sidecar::default()),
         wake: Notify::new(),
@@ -1044,7 +1086,6 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/", get(index))
         .route("/exits", get(index))
-        .route("/subs", get(index))
         .route("/log", get(index))
         .route("/config", get(index))
         .fallback(spa_fallback)
