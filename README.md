@@ -53,12 +53,56 @@ zen-gate 也按出口 IP 分组，但三件事和这里要的不一样：
 | `/exits` | 出口端口表 | 端口 / IP / 地区 / 延迟 / 承载节点 / 状态 / 换绑次数；复制地址、钉住/解锁。**左列是订阅管理**（每条订阅一张卡：名字 / 该订阅贡献了多少节点 / 掩码地址 / 删除，底部折叠式「＋ 新增订阅」）。原先独立的 `/subs` 页已并入这里，旧链接会落到 `/exits` |
 | `/log` | 换绑日志 | 每次「端口换 IP」的旧值、新值、时间、原因 |
 | `/config` | 配置 | 端口 / 探测 / 日志三组旋钮，加一个端口与地址体检 |
+| `/api` | API | 端点表（现读 OpenAPI 规范渲染）、密钥管理、限流额度、错误码、字段字典、试一下 |
 
 底部 dock 是 macOS 浮动样式：鼠标靠近哪项哪项放大，tooltip 在项上方，当前页有强调色和圆点。视觉与交互参数照 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) 的 `floating-dock`（MIT，Copyright (c) 2026 WorkBuddy Manager contributors），用原生 JS/CSS 重写 —— 本项目的面板没有 React 也没有构建步骤。
 
 未知路径由后端 SPA fallback 兜到同一个 HTML，`/api/*` 仍然老实返回 404。
 
-### 配置页
+### API
+
+给外部程序读出口表用的。**面板本身不需要它**，走的是另一条路。
+
+```bash
+curl -s -H "Authorization: Bearer exm_…" http://127.0.0.1:18790/api/v1/exits
+```
+
+返回里每个出口长这样（`proxies.socks5` 就是能直接填进客户端的地址）：
+
+```json
+{
+  "port": 31001, "ip": "203.0.113.7", "country": "US", "latencyMs": 519,
+  "alive": true, "pinned": false, "rebinds": 3,
+  "upSinceMs": 1793628504838, "lastVerifiedMs": 1793631509170,
+  "node":  { "name": "美国8", "proto": "hysteria2" },
+  "proxies": { "socks5": "socks5://127.0.0.1:31001", "http": "http://127.0.0.1:31001" }
+}
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/v1/exits` | 出口列表。`?country=US,JP` `?alive=true` `?pinned=true` `?sort=latency` `?sort=-ip` `?limit=10` |
+| `GET /api/v1/exits/{port}` | 单个出口，端口不存在给 404 |
+| `GET /api/v1/meta` | 服务状态：版本、运行时长、上一轮探活时间、出口计数。给客户端自检用 |
+| `GET /api/v1/openapi.json` | OpenAPI 3.0 规范。**唯一不需要密钥的端点**，它不泄露任何运行期信息 |
+
+规则：
+
+- **认证**：`Authorization: Bearer exm_…`。没有 `?key=` 形式 —— URL 会漏进日志、referer、shell history。
+- **密钥**：面板「API」页新建，明文只显示一次；磁盘上只有 sha256（`/var/lib/exitmap/api-keys.json`，0600）。撤销立即生效。
+- **限流**：默认 120 次/分钟/每个密钥，超了 `429` + `Retry-After`。0 = 不限。页面上可改。
+- **错误码**：`401 missing_token` / `401 bad_token`（无效、抄错、已撤销三种故意不作区分）/ `404 no_such_port` / `429 rate_limited`。
+- **兼容承诺（v1）**：字段只增不改，加字段不算破坏 —— 客户端必须忽略不认识的字段。删字段或改名开 `/api/v2`。
+
+### 文档不会漂
+
+端点表和字段字典**由页面现读 `/api/v1/openapi.json` 渲染**，不是两处手写。另外 `src/api.rs` 里三条单测把规范、DTO 和真实序列化结果三角对账：文档有而响应没有 → 红；响应有而文档没写 → 红。改字段忘了改文档，`cargo test` 直接拦住。
+
+### 为什么不用 OpenAPI 代码生成
+
+`utoipa` 那类 derive 宏能把标注变成规范，代价是给每个 handler 套一层宏和两个依赖。这里只有 4 个端点、1 个响应体，手写规范 + 一条对账测试更小、更直白，而且测试比宏更狠：宏只保证「标注和类型一致」，测试保证「文档和真实字节一致」。
+
+## 配置页
 
 每一项右边都标着**什么时候生效**，别猜：
 
@@ -71,6 +115,49 @@ zen-gate 也按出口 IP 分组，但三件事和这里要的不一样：
 `端口段 / 监听地址 / UDP` 这三项变了会弹出二次确认，因为**所有已有客户端都要跟着改**（换端口）或者**协议面变了**（关掉 UDP）。
 
 「体检」按钮做两件事：报出哪些端口正被别的进程占着（占了那个节点本轮会被跳过），以及每个监听地址是不是真的挂在本机上。体检会排除 Exitmap 自己侧车占用的端口 —— 否则它会把整张表报成"全被占"（这个坑真踩过：检测时旧实例还在跑，结果生成了零 inbound 的配置）。
+
+## API
+
+给外部程序读出口表用的。**面板本身不需要它**，走的是另一条路。
+
+```bash
+curl -s -H "Authorization: Bearer exm_…" http://127.0.0.1:18790/api/v1/exits
+```
+
+返回里每个出口长这样（`proxies.socks5` 就是能直接填进客户端的地址）：
+
+```json
+{
+  "port": 31001, "ip": "203.0.113.7", "country": "US", "latencyMs": 519,
+  "alive": true, "pinned": false, "rebinds": 3,
+  "upSinceMs": 1793628504838, "lastVerifiedMs": 1793631509170,
+  "node":  { "name": "美国8", "proto": "hysteria2" },
+  "proxies": { "socks5": "socks5://127.0.0.1:31001", "http": "http://127.0.0.1:31001" }
+}
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/v1/exits` | 出口列表。`?country=US,JP` `?alive=true` `?pinned=true` `?sort=latency` `?sort=-ip` `?limit=10` |
+| `GET /api/v1/exits/{port}` | 单个出口，端口不存在给 404 |
+| `GET /api/v1/meta` | 服务状态：版本、运行时长、上一轮探活时间、出口计数。给客户端自检用 |
+| `GET /api/v1/openapi.json` | OpenAPI 3.0 规范。**唯一不需要密钥的端点**，它不泄露任何运行期信息 |
+
+规则：
+
+- **认证**：`Authorization: Bearer exm_…`。没有 `?key=` 形式 —— URL 会漏进日志、referer、shell history。
+- **密钥**：面板「API」页新建，明文只显示一次；磁盘上只有 sha256（`/var/lib/exitmap/api-keys.json`，0600）。撤销立即生效。
+- **限流**：默认 120 次/分钟/每个密钥，超了 `429` + `Retry-After`。0 = 不限。页面上可改。
+- **错误码**：`401 missing_token` / `401 bad_token`（无效、抄错、已撤销三种故意不作区分）/ `404 no_such_port` / `429 rate_limited`。
+- **兼容承诺（v1）**：字段只增不改，加字段不算破坏 —— 客户端必须忽略不认识的字段。删字段或改名开 `/api/v2`。
+
+### 文档不会漂
+
+端点表和字段字典**由页面现读 `/api/v1/openapi.json` 渲染**，不是两处手写。另外 `src/api.rs` 里三条单测把规范、DTO 和真实序列化结果三角对账：文档有而响应没有 → 红；响应有而文档没写 → 红。改字段忘了改文档，`cargo test` 直接拦住。
+
+### 为什么不用 OpenAPI 代码生成
+
+`utoipa` 那类 derive 宏能把标注变成规范，代价是给每个 handler 套一层宏和两个依赖。这里只有 4 个端点、1 个响应体，手写规范 + 一条对账测试更小、更直白，而且测试比宏更狠：宏只保证「标注和类型一致」，测试保证「文档和真实字节一致」。
 
 ## 配置
 
@@ -116,7 +203,10 @@ net.ipv4.ip_local_reserved_ports = 18788-18799,21001-21300,31001-31128,32001-324
 
 ## 安全边界
 
-面板**没有鉴权**：能看出口表、能增删订阅（URL 回显只露 `?key=***`），只是靠下面两层挡着：
+面板**没有鉴权**：能看出口表、能增删订阅（URL 回显只露 `?key=***`），只是靠下面两层挡着。
+（`/api/v1/*` 是另一回事：那条路**必须**带 API key。「面板不需要 key」是有意的 —— 浏览器里放 key 等于把 key 写进 HTML。）
+
+**API key 泄露不等于代理权限泄露**：出口端口本来就不认证，key 泄出去泄的是**你的出口 IP 清单**（哪些国家、哪些 IP 在跑），不是别人的代理权限。
 
 1. `listen` 默认只绑 `127.0.0.1`；要远程访问才加上 Tailscale 之类的私有地址（不要绑 `0.0.0.0`）；
 2. 防火墙只放行该网段（例如 `ufw allow from 100.64.0.0/10 to any port 18790 proto tcp`）。

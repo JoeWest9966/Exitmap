@@ -5,14 +5,16 @@
 // unique IP a stable localhost port. The port is the product: filling
 // 127.0.0.1:31005 into a client means "exit from that IP" and nothing else.
 
+mod api;
 mod pool;
 mod probe;
 mod singbox;
 mod subs;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
+    http::{header, HeaderMap},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -90,6 +92,8 @@ struct Config {
     probe_concurrency: usize,
     sing_box: String,
     data_dir: String,
+    /// Public API requests allowed per key per minute. 0 = unlimited.
+    api_rate_limit: u32,
     subscriptions: Vec<Sub>,
 }
 
@@ -113,6 +117,7 @@ impl Default for Config {
             probe_concurrency: 24,
             sing_box: "/usr/local/bin/sing-box".into(),
             data_dir: "/var/lib/exitmap".into(),
+            api_rate_limit: api::DEFAULT_RATE_PER_MIN,
             subscriptions: Vec::new(),
         }
     }
@@ -187,9 +192,12 @@ struct Inner {
     /// probe keep its exit instead of triggering a rebind.
     node_last: HashMap<String, (String, u64)>,
     sub_stats: Vec<SubStat>,
+    keys: api::KeyStore,
+    limiter: api::Limiter,
 }
 
 struct App {
+    started_ms: i64,
     cfg: RwLock<Config>,
     inner: RwLock<Inner>,
     sidecar: Mutex<singbox::Sidecar>,
@@ -215,6 +223,33 @@ impl App {
         std::fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
         std::fs::rename(&tmp, &p)?;
         Ok(())
+    }
+
+    fn keys_path(data_dir: &str) -> PathBuf {
+        PathBuf::from(data_dir).join("api-keys.json")
+    }
+
+    /// API keys live in their own 0600 file: they are credentials, not state,
+    /// and must never end up in a backup of the pool.
+    fn save_keys(data_dir: &str, keys: &api::KeyStore) {
+        let p = Self::keys_path(data_dir);
+        if let Ok(s) = serde_json::to_string_pretty(keys) {
+            let tmp = p.with_extension("json.tmp");
+            let _ = std::fs::write(&tmp, s);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            }
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+
+    fn load_keys(data_dir: &str) -> api::KeyStore {
+        std::fs::read_to_string(Self::keys_path(data_dir))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     fn load_pool(data_dir: &str) -> (Pool, i64) {
@@ -650,6 +685,255 @@ fn mask_url(u: &str) -> String {
     }
 }
 
+
+// ───────────────────────── public v1 API ─────────────────────────
+//
+// Everything under /api/v1 needs a Bearer key. The panel's own /api/* routes
+// stay open: they are loopback/tailnet-trusted and the browser cannot hold a
+// key without shipping it in the HTML.
+
+fn api_err(status: StatusCode, code: &str, msg: &str) -> Response {
+    (status, Json(json!({"ok": false, "error": code, "message": msg}))).into_response()
+}
+
+/// Best address to advertise in `proxies.*`. `0.0.0.0` is not connectable, so
+/// it degrades to loopback.
+fn advertise_host(cfg: &Config) -> String {
+    match cfg.exit_listen.first().map(|s| s.as_str()) {
+        Some("0.0.0.0") | Some("::") | None => "127.0.0.1".into(),
+        Some(a) => a.to_string(),
+    }
+}
+
+fn exit_dto(e: &ExitView, host: &str) -> api::ExitDto {
+    api::ExitDto {
+        port: e.port,
+        ip: e.ip.clone(),
+        country: e.country.clone(),
+        latency_ms: e.latency_ms,
+        alive: e.alive,
+        pinned: e.pinned,
+        rebinds: e.rebinds,
+        up_since_ms: e.since_ms,
+        last_verified_ms: e.verified_ms,
+        node: api::NodeDto {
+            name: e.node_name.clone(),
+            proto: e.proto.clone(),
+        },
+        proxies: api::ProxiesDto {
+            socks5: format!("socks5://{host}:{}", e.port),
+            http: format!("http://{host}:{}", e.port),
+        },
+    }
+}
+
+/// Bearer + key check + rate limit. Returns the key id on success.
+async fn api_guard(app: &Arc<App>, headers: &HeaderMap) -> Result<String, Response> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+                .map(|t| t.trim().to_string())
+        });
+    let token = match token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return Err(api_err(
+                StatusCode::UNAUTHORIZED,
+                "missing_token",
+                "缺少 Authorization: Bearer <key>",
+            ))
+        }
+    };
+    let limit = app.cfg.read().await.api_rate_limit;
+    let now = now_ms();
+    let mut inner = app.inner.write().await;
+    let id = match inner.keys.verify(&token, now) {
+        Some(id) => id,
+        None => {
+            return Err(api_err(
+                StatusCode::UNAUTHORIZED,
+                "bad_token",
+                "密钥无效或已撤销",
+            ))
+        }
+    };
+    if let Err(retry) = inner.limiter.check(&id, limit, now) {
+        drop(inner);
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry.to_string())],
+            Json(json!({"ok": false, "error": "rate_limited",
+                        "message": "超出额度", "retryAfterSeconds": retry})),
+        )
+            .into_response());
+    }
+    drop(inner);
+    app.inner.write().await.limiter.gc(now);
+    Ok(id)
+}
+
+async fn api_v1_exits(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
+    if let Err(r) = api_guard(&app, &headers).await {
+        return r;
+    }
+    let pairs: Vec<(String, String)> = q
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| {
+            (
+                percent_decode(k),
+                percent_decode(&v.replace('+', " ")),
+            )
+        })
+        .collect();
+    let query = api::ExitQuery::parse(&pairs);
+    let cfg = app.cfg.read().await.clone();
+    let host = advertise_host(&cfg);
+    let inner = app.inner.read().await;
+    let mut rows: Vec<api::ExitDto> = inner
+        .pool
+        .exits
+        .iter()
+        .map(|e| exit_dto(e, &host))
+        .filter(|e| query.keeps(e))
+        .collect();
+    query.sort(&mut rows);
+    if let Some(n) = query.limit {
+        rows.truncate(n);
+    }
+    Json(api::ExitsResponse {
+        api_version: api::API_VERSION.into(),
+        generated_at: now_ms(),
+        count: rows.len(),
+        exits: rows,
+    })
+    .into_response()
+}
+
+async fn api_v1_exit(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(port): Path<u16>,
+) -> Response {
+    if let Err(r) = api_guard(&app, &headers).await {
+        return r;
+    }
+    let cfg = app.cfg.read().await.clone();
+    let host = advertise_host(&cfg);
+    let inner = app.inner.read().await;
+    match inner.pool.exits.iter().find(|e| e.port == port) {
+        Some(e) => Json(exit_dto(e, &host)).into_response(),
+        None => api_err(
+            StatusCode::NOT_FOUND,
+            "no_such_port",
+            &format!("{port} 不是当前出口端口"),
+        ),
+    }
+}
+
+async fn api_v1_meta(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = api_guard(&app, &headers).await {
+        return r;
+    }
+    let cfg = app.cfg.read().await.clone();
+    let inner = app.inner.read().await;
+    let alive = app.sidecar.lock().await.alive();
+    Json(json!({
+        "apiVersion": api::API_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+        "nowMs": now_ms(),
+        "uptimeMs": now_ms() - app.started_ms,
+        "exits": {
+            "open": inner.pool.exits.iter().filter(|e| e.alive).count(),
+            "total": inner.pool.exits.len(),
+            "pinned": inner.pool.exits.iter().filter(|e| e.pinned).count(),
+        },
+        "lastProbeMs": inner.status.last_run_ms,
+        "lastProbeOkMs": inner.status.last_ok_ms,
+        "nextProbeMs": inner.status.next_run_ms,
+        "lastProbeRoundMs": inner.status.round_ms,
+        "lastSubFetchMs": inner.status.last_sub_fetch_ms,
+        "probeIntervalMinutes": cfg.refresh_minutes,
+        "subFetchIntervalMinutes": cfg.sub_fetch_minutes,
+        "rateLimitPerMin": cfg.api_rate_limit,
+        "singBoxAlive": alive,
+    }))
+    .into_response()
+}
+
+// The only unauthenticated endpoint: it leaks nothing about this instance.
+async fn api_v1_openapi() -> Json<Value> {
+    Json(api::openapi())
+}
+
+// ───────────────────────── key management (panel) ─────────────────────────
+
+async fn api_list_keys(State(app): State<Arc<App>>) -> Json<Value> {
+    let data_dir = app.cfg.read().await.data_dir.clone();
+    let inner = app.inner.read().await;
+    Json(json!({
+        "keys": inner.keys.list(),
+        "rateLimitPerMin": app.cfg.try_read().map(|c| c.api_rate_limit).unwrap_or(0),
+        "dataDir": data_dir,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct NewKey {
+    name: String,
+}
+
+async fn api_create_key(State(app): State<Arc<App>>, Json(body): Json<NewKey>) -> Json<Value> {
+    let data_dir = app.cfg.read().await.data_dir.clone();
+    let (plain, k) = {
+        let mut inner = app.inner.write().await;
+        let r = inner.keys.create(&body.name, now_ms());
+        App::save_keys(&data_dir, &inner.keys);
+        r
+    };
+    Json(json!({
+        "ok": true,
+        "key": plain,
+        "id": k.id,
+        "name": k.name,
+        "prefix": k.prefix,
+        "note": "这串明文只显示这一次,关掉就再也拿不到了",
+    }))
+}
+
+async fn api_revoke_key(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    let data_dir = app.cfg.read().await.data_dir.clone();
+    let ok = {
+        let mut inner = app.inner.write().await;
+        let ok = inner.keys.revoke(&id);
+        if ok {
+            App::save_keys(&data_dir, &inner.keys);
+        }
+        ok
+    };
+    if ok {
+        Json(json!({"ok": true})).into_response()
+    } else {
+        api_err(StatusCode::NOT_FOUND, "no_such_key", "没有这个密钥")
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .to_string()
+}
+
 async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
     let cfg = app.cfg.read().await.clone();
     let inner = app.inner.read().await;
@@ -777,6 +1061,7 @@ struct ConfigPatch {
     probe_fail_threshold: Option<usize>,
     max_latency_ms: Option<u64>,
     log_retention_days: Option<u64>,
+    api_rate_limit: Option<u32>,
 }
 
 fn public_config(c: &Config) -> Value {
@@ -795,6 +1080,7 @@ fn public_config(c: &Config) -> Value {
         "probeFailThreshold": c.probe_fail_threshold,
         "maxLatencyMs": c.max_latency_ms,
         "logRetentionDays": c.log_retention_days,
+        "apiRateLimit": c.api_rate_limit,
         "singBox": c.sing_box,
         "dataDir": c.data_dir,
     })
@@ -827,6 +1113,9 @@ fn validate_config(c: &Config) -> Result<(), String> {
             c.probe_base,
             probe_end - 1
         ));
+    }
+    if c.api_rate_limit > 100_000 {
+        return Err("API 限流额度太大(>100000/分钟),填 0 表示不限".into());
     }
     if c.refresh_minutes < 1 || c.refresh_minutes > 1440 {
         return Err("探活周期要在 1–1440 分钟之间".into());
@@ -914,6 +1203,9 @@ async fn api_patch_config(
     }
     if let Some(v) = p.log_retention_days {
         c.log_retention_days = v;
+    }
+    if let Some(v) = p.api_rate_limit {
+        c.api_rate_limit = v;
     }
 
     if let Err(e) = validate_config(&c) {
@@ -1041,7 +1333,9 @@ async fn main() -> Result<()> {
 
     let listen = cfg.listen.clone();
     let refresh = cfg.refresh_minutes.max(1);
+    let keys = App::load_keys(&cfg.data_dir);
     let app = Arc::new(App {
+        started_ms: now_ms(),
         cfg: RwLock::new(cfg),
         inner: RwLock::new(Inner {
             pool,
@@ -1053,6 +1347,8 @@ async fn main() -> Result<()> {
             node_fails: HashMap::new(),
             node_last: HashMap::new(),
             sub_stats: Vec::new(),
+            keys,
+            limiter: api::Limiter::default(),
         }),
         sidecar: Mutex::new(singbox::Sidecar::default()),
         wake: Notify::new(),
@@ -1088,6 +1384,7 @@ async fn main() -> Result<()> {
         .route("/exits", get(index))
         .route("/log", get(index))
         .route("/config", get(index))
+        .route("/api", get(index))
         .fallback(spa_fallback)
         .route("/api/state", get(api_state))
         .route("/api/subscriptions", post(api_add_sub))
@@ -1096,6 +1393,12 @@ async fn main() -> Result<()> {
         .route("/api/refresh", post(api_refresh))
         .route("/api/config", get(api_config).patch(api_patch_config))
         .route("/api/diag/ports", post(api_diag_ports))
+        .route("/api/keys", get(api_list_keys).post(api_create_key))
+        .route("/api/keys/{id}", delete(api_revoke_key))
+        .route("/api/v1/exits", get(api_v1_exits))
+        .route("/api/v1/exits/{port}", get(api_v1_exit))
+        .route("/api/v1/meta", get(api_v1_meta))
+        .route("/api/v1/openapi.json", get(api_v1_openapi))
         .with_state(app);
 
     // `listen` may be a comma-separated list: loopback for local tools, the

@@ -145,6 +145,40 @@ ul.log .arrow{color:var(--mute)}
   .side-ph{padding:13px 10px}
 }
 
+/* ── API 页 ─────────────────────────────────────────────────── */
+.api-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:16px;align-items:start}
+@media (max-width:1100px){ .api-grid{grid-template-columns:1fr} }
+.ep{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel2)}
+.ep + .ep{margin-top:8px}
+.ep .line1{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.method{font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.06em;
+  padding:1px 6px;border-radius:5px;background:rgba(110,168,254,.14);color:var(--accent)}
+.path{font-family:var(--mono);font-size:12.5px}
+.ep .sum{font-size:12.5px;color:var(--ink2);margin-top:5px}
+.ep .desc{font-size:12px;color:var(--mute);margin-top:3px;line-height:1.65}
+.params{font-size:11.5px;color:var(--dim);margin-top:6px;line-height:1.75}
+.params code{font-family:var(--mono);color:var(--ink2)}
+.fields{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:12px;margin-top:4px}
+.fields code{font-family:var(--mono);font-size:11.5px;color:var(--accent);white-space:nowrap}
+.fields span{color:var(--mute);line-height:1.6}
+.codewrap{position:relative}
+pre.snip{background:#0b0d11;border:1px solid var(--line);border-radius:9px;padding:10px 12px;
+  font-family:var(--mono);font-size:11.5px;line-height:1.7;color:#c9d4e5;
+  overflow:auto;margin:0;white-space:pre}
+.codewrap .copy{position:absolute;top:7px;right:7px}
+.reveal{margin-top:10px;border:1px solid var(--warn-line);background:var(--warn-soft);
+  border-radius:10px;padding:11px 12px}
+.reveal .k{font-family:var(--mono);font-size:12px;word-break:break-all;color:#ffd9a0;margin:7px 0}
+.tryout{display:flex;gap:8px;margin-top:9px}
+.tryout input{flex:1;font-family:var(--mono);font-size:12px}
+.tryout button{flex:0 0 auto}
+.tryout-out{margin-top:9px}
+.dotline{display:flex;align-items:center;gap:6px}
+.rate-edit{display:flex;align-items:center;gap:8px;margin-top:10px}
+.rate-edit .lbl{font-size:12.5px;color:var(--ink2);white-space:nowrap;flex:0 0 auto}
+.rate-edit input{width:92px;flex:0 0 auto}
+.rate-edit button{flex:0 0 auto;white-space:nowrap}
+
 /* ── 配置页 ───────────────────────────────────────────────── */
 .cfg-group{margin-bottom:16px}
 .cfg-group > h3{font-size:12px;letter-spacing:.07em;text-transform:uppercase;
@@ -297,6 +331,87 @@ ul.log .arrow{color:var(--mute)}
     </div>
   </section>
   <!-- ④ 配置 -->
+  <section class="page" id="page-api">
+    <div class="rowhead">
+      <h2>API<small>给外部程序读出口表用的。面板本身不需要它。</small></h2>
+      <span class="grow"></span>
+      <span class="hint" id="api-ver"></span>
+    </div>
+
+    <div class="api-grid">
+      <!-- 左：端点 + 规则 -->
+      <div>
+        <div class="card" style="padding:15px 16px">
+          <div class="rowhead" style="margin-bottom:2px"><h2 style="font-size:14px">端点</h2>
+            <span class="grow"></span><span class="hint">直接读自 /api/v1/openapi.json</span></div>
+          <div id="api-endpoints"><div class="empty">读取中…</div></div>
+        </div>
+
+        <div class="card" style="padding:15px 16px;margin-top:16px">
+          <h2 style="font-size:14px;margin-bottom:10px">规则</h2>
+          <div class="cfg-hint" style="margin-bottom:8px">认证：每个请求带 <code>Authorization: Bearer exm_…</code>。没有查询参数形式的 key —— URL 会漏进日志和 referer。</div>
+          <div class="codewrap"><pre class="snip" id="api-curl"></pre>
+            <button class="tiny copy" data-copy="api-curl">复制</button></div>
+
+          <div class="rate-edit">
+            <span class="lbl">限流</span>
+            <input type="number" id="api-rate" min="0" max="100000">
+            <span class="cfg-hint" style="flex:1">次 / 分钟 / 每个密钥</span>
+            <button class="tiny" id="api-rate-save">保存</button>
+          </div>
+          <div class="cfg-hint">0 = 不限。超了返回 <code>429</code> + <code>Retry-After</code>（秒）。</div>
+
+          <div style="margin-top:14px">
+            <div class="cfg-hint" style="margin-bottom:6px">错误码：</div>
+            <div class="fields">
+              <code>401 missing_token</code><span>没带 Authorization 头，或格式不是 Bearer。</span>
+              <code>401 bad_token</code><span>key 不存在、抄错、或已撤销 —— 三种情况故意不作区分。</span>
+              <code>404 no_such_port</code><span>这个端口当前不是出口。</span>
+              <code>429 rate_limited</code><span>超额度，响应头 <code>Retry-After</code> 是等待秒数。</span>
+            </div>
+          </div>
+
+          <div style="margin-top:14px">
+            <div class="cfg-hint" style="margin-bottom:6px">兼容承诺（v1）：</div>
+            <div class="cfg-hint" style="line-height:1.85">
+              字段只增不改。加字段不算破坏，客户端必须忽略不认识的字段；
+              删字段或改名开 <code>/api/v2</code>。响应里的 <code>apiVersion</code> 永远是 <code>v1</code>。
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="padding:15px 16px;margin-top:16px">
+          <h2 style="font-size:14px;margin-bottom:8px">字段字典</h2>
+          <div class="fields" id="api-fields"><span class="dim">读取中…</span></div>
+        </div>
+      </div>
+
+      <!-- 右：密钥 + 试一下 -->
+      <div>
+        <div class="card" style="padding:15px 16px">
+          <div class="rowhead" style="margin-bottom:6px">
+            <h2 style="font-size:14px">密钥</h2>
+            <span class="grow"></span>
+            <button class="tiny primary" id="key-new">新建</button>
+          </div>
+          <div id="key-reveal"></div>
+          <div id="key-list"><div class="empty">读取中…</div></div>
+          <div class="cfg-hint" style="margin-top:9px">明文只显示一次，库里只有 sha256。撤销立即生效。</div>
+        </div>
+
+        <div class="card" style="padding:15px 16px;margin-top:16px">
+          <h2 style="font-size:14px;margin-bottom:6px">试一试</h2>
+          <div class="cfg-hint">贴一个 key 打一次 <code>/api/v1/exits</code>。key 只存在这个页面的内存里，刷新就没了。</div>
+          <div class="tryout">
+            <input id="try-key" type="password" placeholder="exm_…" autocomplete="off" spellcheck="false">
+            <button class="tiny primary" id="try-go">跑一下</button>
+          </div>
+          <div class="tryout-out" id="try-out"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="page" id="page-config">
     <div class="rowhead">
       <h2>配置<small>改完点保存；右边徽标说明这一项什么时候生效</small></h2>
@@ -417,6 +532,7 @@ const ago = t => { if(!t) return "—"; const s = Math.round((Date.now()-t)/1000
 const PAGES = [
   {path:"/exits", title:"出口端口表", icon:`<svg viewBox="0 0 24 24"><path d="M14 3h5a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-5"/><path d="M10 12H3"/><path d="m6 9-3 3 3 3"/></svg>`},
   {path:"/log",   title:"换绑日志",  icon:`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 1.9"/></svg>`},
+  {path:"/api", title:"API", icon:`<svg viewBox="0 0 24 24"><path d="M9 5 3.5 12 9 19"/><path d="M15 5l5.5 7L15 19"/></svg>`},
   {path:"/config", title:"配置", icon:`<svg viewBox="0 0 24 24"><path d="M4 7h9M18 7h2M4 12h3M12 12h8M4 17h12"/><circle cx="15.5" cy="7" r="2.2"/><circle cx="9.5" cy="12" r="2.2"/><circle cx="18" cy="17" r="2.2"/></svg>`},
 ];
 const resolve = p => (PAGES.find(x => x.path === p) ? p : "/exits");
@@ -442,6 +558,7 @@ function show(path, push){
   document.title = "Exitmap · " + (PAGES.find(p=>p.path===cur)||PAGES[0]).title;
   // 进配置页时刷新一次值，但有未保存改动就不覆盖
   if(cur === "/config" && typeof loadConfig === "function" && noUnsaved()) loadConfig();
+  if(cur === "/api" && typeof loadApiPage === "function") loadApiPage();
 }
 
 document.addEventListener("click", ev => {
@@ -727,6 +844,148 @@ $("#cfg-diag").onclick = async () => {
       <div class="hint" style="margin-top:8px">检查了 ${d.checkedProbe} 个探测端口 + ${d.checkedExit} 个出口端口</div>`;
   }catch(e){ out.innerHTML = `<span class="err">体检失败：${esc(e.message)}</span>`; }
 };
+
+// ── API 页 ────────────────────────────────────────────────────────────────
+// 端点表与字段字典都从 /api/v1/openapi.json 现读现渲染：文档只有一份，
+// 页面不可能比后端更旧。
+let API_SPEC = null;
+
+function apiCurl(){
+  return `curl -s -H "Authorization: Bearer exm_…" \\\n  ${location.origin}/api/v1/exits`;
+}
+
+function renderEndpoints(spec){
+  const paths = spec.paths || {};
+  const html = Object.entries(paths).map(([p, ops]) => {
+    const verb = Object.keys(ops)[0] || "get";
+    const op = ops[verb] || {};
+    const pub = Array.isArray(op.security) && op.security.length === 0
+      ? ` <span class="badge off">免密钥</span>` : "";
+    const params = (op.parameters || []).map(x =>
+      `<code>${esc(x.name)}</code> ${esc(x.description || "")}`).join("<br>");
+    return `<div class="ep">
+      <div class="line1"><span class="method">${verb.toUpperCase()}</span>
+        <span class="path">${esc(p)}</span>${pub}</div>
+      <div class="sum">${esc(op.summary || "")}</div>
+      ${op.description ? `<div class="desc">${esc(op.description)}</div>` : ""}
+      ${params ? `<div class="params">${params}</div>` : ""}
+    </div>`;
+  }).join("");
+  $("#api-endpoints").innerHTML = html || `<div class="empty">规范里没有端点</div>`;
+
+  const props = (((spec.components || {}).schemas || {}).Exit || {}).properties || {};
+  const rows = [];
+  for(const [k, v] of Object.entries(props)){
+    if(v.properties){
+      for(const [k2, v2] of Object.entries(v.properties)) rows.push([`${k}.${k2}`, v2.description]);
+    }else{
+      rows.push([k, v.description]);
+    }
+  }
+  $("#api-fields").innerHTML = rows.length
+    ? rows.map(([k, d]) => `<code>${esc(k)}</code><span>${esc(d || "")}</span>`).join("")
+    : `<span class="dim">规范里没写字段</span>`;
+}
+
+function renderKeys(d){
+  const rows = d.keys || [];
+  const tb = $("#key-list");
+  if(!rows.length){
+    tb.innerHTML = `<div class="side-ph">还没有密钥<br><span class="dim">点右上「新建」</span></div>`;
+  }else{
+    tb.innerHTML = `<table><thead><tr>
+        <th>名字</th><th>前缀</th><th>最后使用</th><th>请求数</th><th></th>
+      </tr></thead><tbody>` + rows.map(k => `
+        <tr>
+          <td>${esc(k.name)}${k.revoked ? ` <span class="badge off">已撤销</span>` : ""}</td>
+          <td class="mono dim">${esc(k.prefix)}…</td>
+          <td class="dim">${k.lastUsedMs ? ago(k.lastUsedMs) : "从未"}</td>
+          <td class="dim">${k.hits}</td>
+          <td>${k.revoked ? `<span class="dim">—</span>`
+                : `<button class="tiny" data-revoke="${esc(k.id)}">撤销</button>`}</td>
+        </tr>`).join("") + `</tbody></table>`;
+    tb.querySelectorAll("[data-revoke]").forEach(b => b.onclick = async () => {
+      if(!confirm("撤销这个密钥？正在用它的程序会立刻收到 401。")) return;
+      try{
+        await api("/api/keys/" + encodeURIComponent(b.dataset.revoke), {method:"DELETE"});
+        toast("已撤销"); loadApiPage();
+      }catch(e){ toast("撤销失败: " + e.message); }
+    });
+  }
+  if(d.rateLimitPerMin !== undefined) $("#api-rate").value = d.rateLimitPerMin;
+}
+
+async function loadApiPage(){
+  $("#api-curl").textContent = apiCurl();
+  try{
+    if(!API_SPEC) API_SPEC = await (await fetch("/api/v1/openapi.json")).json();
+    renderEndpoints(API_SPEC);
+    $("#api-ver").textContent = `${API_SPEC.openapi} · api ${(API_SPEC.info || {}).version || "v1"}`;
+  }catch(e){ toast("读规范失败: " + e.message); }
+  try{ renderKeys(await api("/api/keys")); }
+  catch(e){ $("#key-list").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+$("#key-new").onclick = async () => {
+  const name = prompt("这个密钥给谁用？（写着方便以后撤销，例如 ci / homelab）");
+  if(name === null) return;
+  try{
+    const r = await api("/api/keys", {method:"POST",
+      headers:{"content-type":"application/json"}, body:JSON.stringify({name})});
+    $("#key-reveal").innerHTML = `<div class="reveal">
+      <div style="font-size:12.5px">「${esc(r.name)}」的密钥 —— ${esc(r.note)}</div>
+      <div class="k" id="key-plain">${esc(r.key)}</div>
+      <div class="btnrow">
+        <button class="tiny primary" id="key-copy">复制密钥</button>
+        <button class="tiny" id="key-hide">藏起来</button>
+      </div></div>`;
+    $("#key-copy").onclick = async () => {
+      (await copyText(r.key)) ? toast("已复制") : toast("复制不了，手动选中吧");
+    };
+    $("#key-hide").onclick = () => { $("#key-reveal").innerHTML = ""; };
+    loadApiPage();
+  }catch(e){ toast("新建失败: " + e.message); }
+};
+
+$("#api-rate-save").onclick = async () => {
+  const v = parseInt($("#api-rate").value, 10);
+  if(!(v >= 0)) return toast("填个 ≥ 0 的整数");
+  try{
+    await api("/api/config", {method:"PATCH", headers:{"content-type":"application/json"},
+      body:JSON.stringify({apiRateLimit: v})});
+    toast(v ? `已保存：每个密钥每分钟 ${v} 次` : "已保存：不限流");
+  }catch(e){ toast("保存失败: " + e.message); }
+};
+
+$("#try-go").onclick = async () => {
+  const k = $("#try-key").value.trim();
+  if(!k) return toast("先贴一个 key");
+  const out = $("#try-out");
+  out.innerHTML = `<div class="empty">请求中…</div>`;
+  const t0 = performance.now();
+  try{
+    const r = await fetch("/api/v1/exits?limit=2", {headers:{authorization: "Bearer " + k}});
+    const ms = Math.round(performance.now() - t0);
+    const txt = await r.text();
+    let body = txt;
+    try{ body = JSON.stringify(JSON.parse(txt), null, 2); }catch(e){}
+    const ra = r.headers.get("retry-after");
+    out.innerHTML = `<div class="dotline" style="margin-bottom:7px">
+        <span class="badge ${r.ok ? "on" : "off"}"><i class="dot"></i>HTTP ${r.status}</span>
+        <span class="dim" style="font-size:11.5px">${ms} ms</span>
+        ${ra ? `<span class="dim" style="font-size:11.5px">Retry-After ${esc(ra)}s</span>` : ""}
+      </div><pre class="snip" style="max-height:340px">${esc(body)}</pre>`;
+  }catch(e){ out.innerHTML = `<div class="empty">请求失败：${esc(e.message)}</div>`; }
+};
+
+// 通用复制按钮：data-copy 指向一个元素的 id，复制它的文本
+document.addEventListener("click", async ev => {
+  const b = ev.target.closest && ev.target.closest("[data-copy]");
+  if(!b) return;
+  const el = document.getElementById(b.dataset.copy);
+  if(!el) return;
+  (await copyText(el.textContent)) ? toast("已复制") : toast("复制不了，手动选中吧");
+});
 
 show(location.pathname, false);
 load();

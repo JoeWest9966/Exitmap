@@ -16,6 +16,11 @@ Copyright (c) 2026 LAGcomcom
 那些解析上的坑（`*_auto` uTLS 别名、`fp=unsafe` 会让整份配置被 sing-box 拒掉、ss 的 legacy base64 形状）
 是上游用生产流量换来的，所以这里是移植而不是重写。
 
+## 依赖
+
+`axum` / `tokio` / `serde` / `reqwest` / `sha2` 等全部为 MIT 或 Apache-2.0，见 `Cargo.lock`。
+其中 `sha2` 由 [RustCrypto](https://github.com/RustCrypto/hashes) 提供（MIT OR Apache-2.0），只用来存 API key 的哈希。
+
 ## assets/index.html — workbuddy-manager
 
 底部浮动 dock 的视觉与交互参数（容器圆角/毛玻璃、项 44→68px 放大、图标 21→34px、
