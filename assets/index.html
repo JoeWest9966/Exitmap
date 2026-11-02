@@ -16,6 +16,7 @@
   --bad:#f87a7a; --bad-soft:rgba(248,122,122,.12);
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   --dock-h:76px;
+  --side-w:264px;   /* 出口页左列宽度：想换就改这一个数 */
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -94,6 +95,38 @@ ul.log li{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;
 ul.log li:last-child{border-bottom:none}
 ul.log .t{font-family:var(--mono);color:var(--mute);min-width:64px}
 ul.log .arrow{color:var(--mute)}
+
+/* ── 出口页布局：左列 + 主区 ────────────────────────────────── */
+.exits-layout{
+  display:grid;grid-template-columns:var(--side-w) minmax(0,1fr);
+  gap:18px;align-items:start;
+}
+.side-panel{
+  position:sticky;top:64px;
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:14px;
+  max-height:calc(100vh - 64px - var(--dock-h) - 32px);overflow:auto;
+}
+.side-head{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding-bottom:9px;margin-bottom:11px;border-bottom:1px solid var(--line-soft);
+}
+.side-title{font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--mute);font-weight:600}
+.side-body{display:flex;flex-direction:column;gap:10px}
+/* 占位块：内容定下来就删掉它 */
+.side-ph{
+  padding:20px 12px;border:1px dashed var(--line);border-radius:10px;
+  text-align:center;color:var(--mute);font-size:12.5px;line-height:1.7;
+}
+.side-panel::-webkit-scrollbar{width:8px}
+.side-panel::-webkit-scrollbar-thumb{background:rgba(255,255,255,.10);border-radius:8px}
+
+@media (max-width:980px){
+  /* 窄屏：左列摞到表格上方，不再吸顶，占位块也收薄一点 */
+  .exits-layout{grid-template-columns:1fr}
+  .side-panel{position:static;max-height:none}
+  .side-ph{padding:13px 10px}
+}
 
 /* ── 配置页 ───────────────────────────────────────────────── */
 .cfg-group{margin-bottom:16px}
@@ -194,18 +227,33 @@ ul.log .arrow{color:var(--mute)}
 <main>
   <!-- ① 出口端口表 -->
   <section class="page" id="page-exits">
-    <div class="rowhead">
-      <h2>出口端口表<small>127.0.0.1:端口 就是那个出口 IP，socks5 与 http 同端口</small></h2>
-      <span class="grow"></span>
-      <span class="hint" id="exits-meta"></span>
-    </div>
-    <div class="card">
-      <table>
-        <thead><tr>
-          <th>端口</th><th>出口 IP</th><th>地区</th><th>延迟</th><th>承载节点</th><th>状态</th><th>换绑</th><th></th>
-        </tr></thead>
-        <tbody id="exits"><tr><td colspan="8" class="empty">读取中…</td></tr></tbody>
-      </table>
+    <div class="exits-layout">
+      <!-- 左列：内容待定。往里填东西就写进 #side-body，样式跟着 .side-panel 走。 -->
+      <aside class="side-panel" id="side">
+        <div class="side-head">
+          <span class="side-title" id="side-title">侧栏</span>
+          <span class="hint">待定</span>
+        </div>
+        <div class="side-body" id="side-body">
+          <div class="side-ph">左列已就位<br><span class="dim">内容待定 —— 想放什么告诉我</span></div>
+        </div>
+      </aside>
+
+      <div class="exits-main">
+        <div class="rowhead">
+          <h2>出口端口表<small>127.0.0.1:端口 就是那个出口 IP，socks5 与 http 同端口</small></h2>
+          <span class="grow"></span>
+          <span class="hint" id="exits-meta"></span>
+        </div>
+        <div class="card">
+          <table>
+            <thead><tr>
+              <th>端口</th><th>出口 IP</th><th>地区</th><th>延迟</th><th>承载节点</th><th>状态</th><th>换绑</th><th></th>
+            </tr></thead>
+            <tbody id="exits"><tr><td colspan="8" class="empty">读取中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </section>
 
