@@ -68,9 +68,21 @@ struct Config {
     port_base: u16,
     /// First probe-only inbound. One per candidate node, never exposed.
     probe_base: u16,
+    /// Where exit ports listen. Multiple addresses allowed: loopback plus a
+    /// private interface (LAN / tailnet) is the point.
+    exit_listen: Vec<String>,
     max_exits: usize,
+    /// TCP only on exit ports (UDP is rejected by a route rule).
+    disable_udp: bool,
     /// Cap on candidates probed per round. 0 = no cap.
     max_probe_nodes: usize,
+    /// A node is dropped from the pool only after this many consecutive failed
+    /// probes — one flaky round should not cost you an exit.
+    probe_fail_threshold: usize,
+    /// Exits slower than this are kept out of the table. 0 = no limit.
+    max_latency_ms: u64,
+    /// Rebind-log retention. 0 = keep forever.
+    log_retention_days: u64,
     refresh_minutes: u64,
     sub_fetch_minutes: u64,
     probe_url: String,
@@ -87,8 +99,13 @@ impl Default for Config {
             listen: "127.0.0.1:18790".into(),
             port_base: 31001,
             probe_base: 32001,
+            exit_listen: vec!["127.0.0.1".into()],
             max_exits: 128,
+            disable_udp: false,
             max_probe_nodes: 200,
+            probe_fail_threshold: 2,
+            max_latency_ms: 0,
+            log_retention_days: 0,
             refresh_minutes: 5,
             sub_fetch_minutes: 30,
             probe_url: "http://api.ipify.org".into(),
@@ -154,6 +171,11 @@ struct Inner {
     pool: Pool,
     nodes: Vec<subs::Node>,
     status: Status,
+    /// node id -> consecutive failed probes (cleared by one success).
+    node_fails: HashMap<String, usize>,
+    /// node id -> last good (egress ip, latency). Lets a node that missed one
+    /// probe keep its exit instead of triggering a rebind.
+    node_last: HashMap<String, (String, u64)>,
 }
 
 struct App {
@@ -214,30 +236,44 @@ impl App {
         out
     }
 
-    /// Ports currently un-bindable, i.e. squatted by another process.
-    fn busy_ports(nodes: &[subs::Node], pool: &Pool, probe_base: u16) -> std::collections::HashSet<u16> {
+    /// Ports currently un-bindable, i.e. squatted by another process. Ports our
+    /// own sidecar holds are excluded — it is still running while we plan.
+    fn busy_ports(
+        nodes: &[subs::Node],
+        pool: &Pool,
+        probe_base: u16,
+        own: &std::collections::HashSet<u16>,
+    ) -> std::collections::HashSet<u16> {
         let mut want: Vec<u16> = nodes
             .iter()
             .enumerate()
             .map(|(i, _)| probe_base + i as u16)
             .collect();
         want.extend(pool.exits.iter().map(|e| e.port));
-        singbox::free_ports(&want)
+        singbox::free_ports(&want, own)
     }
 
     /// Rebuild + apply the sing-box config from the current pool.
     async fn apply_config(&self) -> Result<()> {
         let cfg = self.cfg.read().await.clone();
         let nodes = self.inner.read().await.nodes.clone();
+        let mut sc = self.sidecar.lock().await;
+        let own = sc.ports.clone();
         let (slots, busy) = {
             let inner = self.inner.read().await;
             (
                 Self::build_exit_slots(&nodes, &inner.pool),
-                Self::busy_ports(&nodes, &inner.pool, cfg.probe_base),
+                Self::busy_ports(&nodes, &inner.pool, cfg.probe_base, &own),
             )
         };
-        let conf = singbox::build_config(&nodes, cfg.probe_base, &slots, &busy);
-        let mut sc = self.sidecar.lock().await;
+        let conf = singbox::build_config(
+            &nodes,
+            cfg.probe_base,
+            &slots,
+            &busy,
+            &cfg.exit_listen,
+            cfg.disable_udp,
+        );
         sc.apply(
             &cfg.sing_box,
             &self.singbox_conf(&cfg.data_dir),
@@ -364,10 +400,21 @@ impl App {
         // ── 2. make sure the probe ports exist before probing them ────────
         {
             let mut sc = self.sidecar.lock().await;
+            let own = sc.ports.clone();
             let pool = self.inner.read().await.pool.clone();
             let slots = Self::build_exit_slots(&nodes, &pool);
-            let busy = Self::busy_ports(&nodes, &pool, cfg.probe_base);
-            let conf = singbox::build_config(&nodes, cfg.probe_base, &slots, &busy);
+            let busy = Self::busy_ports(&nodes, &pool, cfg.probe_base, &own);
+            if !busy.is_empty() {
+                eprintln!("[exitmap] {} 个端口被别的进程占着,对应节点本轮跳过", busy.len());
+            }
+            let conf = singbox::build_config(
+                &nodes,
+                cfg.probe_base,
+                &slots,
+                &busy,
+                &cfg.exit_listen,
+                cfg.disable_udp,
+            );
             if let Err(e) = sc
                 .apply(
                     &cfg.sing_box,
@@ -400,12 +447,35 @@ impl App {
         }
 
         // ── 4. group by egress IP, best node per IP ───────────────────────
+        // 失败不再一次就摘:探不通一次只记一笔,连续失败到阈值才真的退出轮询。
+        // 阈值内的节点用它上一次探到的出口 IP 顶上 —— 机场抖一下不该付出一次换绑。
+        let threshold = cfg.probe_fail_threshold.max(1);
         let mut groups: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
         let mut ok = 0usize;
-        for (i, r) in results.iter().enumerate() {
-            if let Some((ip, ms)) = r {
-                ok += 1;
-                groups.entry(ip.clone()).or_default().push((i, *ms));
+        {
+            let mut inner = self.inner.write().await;
+            for (i, r) in results.iter().enumerate() {
+                let id = nodes[i].id.clone();
+                match r {
+                    Some((ip, ms)) => {
+                        ok += 1;
+                        inner.node_fails.remove(&id);
+                        inner.node_last.insert(id.clone(), (ip.clone(), *ms));
+                        groups.entry(ip.clone()).or_default().push((i, *ms));
+                    }
+                    None => {
+                        let n = {
+                            let c = inner.node_fails.entry(id.clone()).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        if n < threshold {
+                            if let Some((ip, ms)) = inner.node_last.get(&id).cloned() {
+                                groups.entry(ip).or_default().push((i, ms));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -447,6 +517,10 @@ impl App {
             });
         }
 
+        if cfg.max_latency_ms > 0 {
+            live.retain(|l| l.latency_ms <= cfg.max_latency_ms);
+        }
+
         // ── 5. countries for IPs we have not seen before ──────────────────
         let ips: Vec<String> = live.iter().map(|l| l.ip.clone()).collect();
         self.fill_countries(&ips).await;
@@ -471,6 +545,17 @@ impl App {
         if changed {
             if let Err(e) = self.apply_config().await {
                 self.inner.write().await.status.last_error = e.to_string();
+            }
+        }
+
+        if cfg.log_retention_days > 0 {
+            let cutoff = now - cfg.log_retention_days as i64 * 86_400_000;
+            let mut inner = self.inner.write().await;
+            let before = inner.pool.log.len();
+            inner.pool.log.retain(|r| r.at_ms >= cutoff);
+            let gone = before - inner.pool.log.len();
+            if gone > 0 {
+                eprintln!("[exitmap] 换绑日志过 {} 天,清掉 {gone} 条", cfg.log_retention_days);
             }
         }
 
@@ -630,6 +715,251 @@ async fn api_refresh(State(app): State<Arc<App>>) -> Response {
     (StatusCode::OK, "queued").into_response()
 }
 
+// ── 配置面 ──────────────────────────────────────────────────────────────────
+
+/// Anything the panel may change. Deliberately a separate shape from Config:
+/// `subscriptions` holds the URL-as-credential and has its own endpoints, so it
+/// never leaks through this one.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ConfigPatch {
+    port_base: Option<u16>,
+    exit_listen: Option<Vec<String>>,
+    max_exits: Option<usize>,
+    disable_udp: Option<bool>,
+    refresh_minutes: Option<u64>,
+    sub_fetch_minutes: Option<u64>,
+    probe_url: Option<String>,
+    probe_timeout_ms: Option<u64>,
+    probe_concurrency: Option<usize>,
+    max_probe_nodes: Option<usize>,
+    probe_fail_threshold: Option<usize>,
+    max_latency_ms: Option<u64>,
+    log_retention_days: Option<u64>,
+}
+
+fn public_config(c: &Config) -> Value {
+    json!({
+        "portBase": c.port_base,
+        "probeBase": c.probe_base,
+        "exitListen": c.exit_listen,
+        "maxExits": c.max_exits,
+        "disableUdp": c.disable_udp,
+        "refreshMinutes": c.refresh_minutes,
+        "subFetchMinutes": c.sub_fetch_minutes,
+        "probeUrl": c.probe_url,
+        "probeTimeoutMs": c.probe_timeout_ms,
+        "probeConcurrency": c.probe_concurrency,
+        "maxProbeNodes": c.max_probe_nodes,
+        "probeFailThreshold": c.probe_fail_threshold,
+        "maxLatencyMs": c.max_latency_ms,
+        "logRetentionDays": c.log_retention_days,
+        "singBox": c.sing_box,
+        "dataDir": c.data_dir,
+    })
+}
+
+/// Range checks. Everything here exists because a bad value takes the whole
+/// table down rather than one row: overlapping port ranges, a probe URL our
+/// plaintext-only probe cannot fetch, a zero-length pool.
+fn validate_config(c: &Config) -> Result<(), String> {
+    if c.port_base < 1024 {
+        return Err("出口端口起始号要 ≥ 1024".into());
+    }
+    if c.max_exits == 0 || c.max_exits > 512 {
+        return Err("出口槽位要在 1–512 之间".into());
+    }
+    let exit_end = c.port_base as u32 + c.max_exits as u32;
+    if exit_end > 65536 {
+        return Err(format!(
+            "端口段越界: {} + {} 个槽位 超过 65535",
+            c.port_base, c.max_exits
+        ));
+    }
+    let probe_end = c.probe_base as u32 + c.max_probe_nodes.max(1) as u32;
+    let exit_start = c.port_base as u32;
+    if exit_start < probe_end && (c.probe_base as u32) < exit_end {
+        return Err(format!(
+            "出口端口段 {}-{} 与探测端口段 {}-{} 重叠",
+            c.port_base,
+            exit_end - 1,
+            c.probe_base,
+            probe_end - 1
+        ));
+    }
+    if c.refresh_minutes < 1 || c.refresh_minutes > 1440 {
+        return Err("探活周期要在 1–1440 分钟之间".into());
+    }
+    if c.sub_fetch_minutes < 1 || c.sub_fetch_minutes > 1440 {
+        return Err("拉订阅周期要在 1–1440 分钟之间".into());
+    }
+    if !c.probe_url.starts_with("http://") {
+        return Err("探针地址必须是 http:// —— 探针是从节点里裸跑 socks5 + 明文 HTTP,没有 TLS".into());
+    }
+    if url::Url::parse(&c.probe_url).map(|u| u.host_str().is_none()).unwrap_or(true) {
+        return Err("探针地址不是一个合法的 URL".into());
+    }
+    if c.probe_timeout_ms < 500 || c.probe_timeout_ms > 30000 {
+        return Err("探测超时要在 500–30000 毫秒之间".into());
+    }
+    if c.probe_concurrency < 1 || c.probe_concurrency > 128 {
+        return Err("探测并发要在 1–128 之间".into());
+    }
+    if c.max_probe_nodes > 1000 {
+        return Err("每轮探测节点上限最多 1000".into());
+    }
+    if c.probe_fail_threshold < 1 || c.probe_fail_threshold > 10 {
+        return Err("连续失败阈值要在 1–10 之间".into());
+    }
+    if c.max_latency_ms > 20000 {
+        return Err("延迟上限最多 20000 毫秒".into());
+    }
+    if c.log_retention_days > 3650 {
+        return Err("日志保留最多 3650 天".into());
+    }
+    for a in &c.exit_listen {
+        if a.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!("监听地址 {a} 不是合法 IP"));
+        }
+    }
+    Ok(())
+}
+
+async fn api_config(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(public_config(&app.cfg.read().await.clone()))
+}
+
+async fn api_patch_config(
+    State(app): State<Arc<App>>,
+    Json(p): Json<ConfigPatch>,
+) -> Response {
+    let old = app.cfg.read().await.clone();
+    let mut c = old.clone();
+    if let Some(v) = p.port_base {
+        c.port_base = v;
+    }
+    if let Some(v) = p.exit_listen {
+        c.exit_listen = singbox::normalize_listen(&v);
+    }
+    if let Some(v) = p.max_exits {
+        c.max_exits = v;
+    }
+    if let Some(v) = p.disable_udp {
+        c.disable_udp = v;
+    }
+    if let Some(v) = p.refresh_minutes {
+        c.refresh_minutes = v;
+    }
+    if let Some(v) = p.sub_fetch_minutes {
+        c.sub_fetch_minutes = v;
+    }
+    if let Some(v) = p.probe_url {
+        c.probe_url = v.trim().to_string();
+    }
+    if let Some(v) = p.probe_timeout_ms {
+        c.probe_timeout_ms = v;
+    }
+    if let Some(v) = p.probe_concurrency {
+        c.probe_concurrency = v;
+    }
+    if let Some(v) = p.max_probe_nodes {
+        c.max_probe_nodes = v;
+    }
+    if let Some(v) = p.probe_fail_threshold {
+        c.probe_fail_threshold = v;
+    }
+    if let Some(v) = p.max_latency_ms {
+        c.max_latency_ms = v;
+    }
+    if let Some(v) = p.log_retention_days {
+        c.log_retention_days = v;
+    }
+
+    if let Err(e) = validate_config(&c) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    let ports_moved = c.port_base != old.port_base;
+    let needs_singbox = ports_moved
+        || c.exit_listen != old.exit_listen
+        || c.disable_udp != old.disable_udp
+        || c.max_exits != old.max_exits;
+
+    *app.cfg.write().await = c.clone();
+    if ports_moved {
+        app.inner.write().await.pool.rebase(c.port_base);
+    }
+    if let Err(e) = save_config(&c) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
+    }
+    let mut restarted = false;
+    if needs_singbox {
+        match app.apply_config().await {
+            Ok(_) => restarted = true,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("配置已保存,但 sing-box 重新加载失败: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let note = if ports_moved {
+        "端口段变了:所有客户端需要换成新端口"
+    } else if restarted {
+        "已重载 sing-box(现有连接会断一下)"
+    } else {
+        "下一轮生效"
+    };
+    Json(json!({"ok": true, "singBoxReloaded": restarted, "note": note})).into_response()
+}
+
+/// Port footprint: who is squatting what, and is each listen address actually
+/// local. Read-only, safe to hit any time.
+async fn api_diag_ports(State(app): State<Arc<App>>) -> Json<Value> {
+    let cfg = app.cfg.read().await.clone();
+    let (node_count, exit_ports) = {
+        let inner = app.inner.read().await;
+        (
+            inner.nodes.len(),
+            inner
+                .pool
+                .exits
+                .iter()
+                .filter(|e| e.alive)
+                .map(|e| e.port)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let probe_ports: Vec<u16> = (0..node_count)
+        .map(|i| cfg.probe_base.wrapping_add(i as u16))
+        .collect();
+    let mut all: Vec<u16> = probe_ports.clone();
+    all.extend(exit_ports.iter().copied());
+    let own = app.sidecar.lock().await.ports.clone();
+    let busy = singbox::free_ports(&all, &own);
+    let listen: Vec<Value> = cfg
+        .exit_listen
+        .iter()
+        .map(|addr| match addr.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                let ok = std::net::TcpListener::bind((ip, 0)).is_ok();
+                json!({"addr": addr, "ok": ok,
+                       "note": if ok { "" } else { "该地址不是本机地址(绑不上)" }})
+            }
+            Err(_) => json!({"addr": addr, "ok": false, "note": "不是合法 IP"}),
+        })
+        .collect();
+    Json(json!({
+        "busyProbe": probe_ports.iter().filter(|p| busy.contains(p)).collect::<Vec<_>>(),
+        "busyExit": exit_ports.iter().filter(|p| busy.contains(p)).collect::<Vec<_>>(),
+        "checkedProbe": probe_ports.len(),
+        "checkedExit": exit_ports.len(),
+        "listen": listen,
+    }))
+}
+
 async fn index() -> Html<&'static str> {
     Html(PANEL)
 }
@@ -679,10 +1009,18 @@ async fn main() -> Result<()> {
                 last_sub_fetch_ms: last_sub_fetch,
                 ..Default::default()
             },
+            node_fails: HashMap::new(),
+            node_last: HashMap::new(),
         }),
         sidecar: Mutex::new(singbox::Sidecar::default()),
         wake: Notify::new(),
     });
+
+    {
+        let data_dir = app.cfg.read().await.data_dir.clone();
+        let conf = app.singbox_conf(&data_dir);
+        singbox::Sidecar::kill_strays(&conf);
+    }
 
     // Worker: first cycle immediately, then on the configured cadence or when
     // the panel pokes it.
@@ -708,12 +1046,15 @@ async fn main() -> Result<()> {
         .route("/exits", get(index))
         .route("/subs", get(index))
         .route("/log", get(index))
+        .route("/config", get(index))
         .fallback(spa_fallback)
         .route("/api/state", get(api_state))
         .route("/api/subscriptions", post(api_add_sub))
         .route("/api/subscriptions/{id}", delete(api_del_sub))
         .route("/api/exits/{slot}/pin", post(api_pin))
         .route("/api/refresh", post(api_refresh))
+        .route("/api/config", get(api_config).patch(api_patch_config))
+        .route("/api/diag/ports", post(api_diag_ports))
         .with_state(app);
 
     // `listen` may be a comma-separated list: loopback for local tools, the

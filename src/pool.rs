@@ -80,7 +80,9 @@ pub struct Pool {
     pub countries: HashMap<String, String>,
 }
 
-const LOG_CAP: usize = 200;
+/// Hard bound on memory only — the real retention policy is time-based
+/// (`logRetentionDays`), so this is deliberately far above any sane day count.
+const LOG_CAP: usize = 20_000;
 
 impl Pool {
     pub fn slot_port(port_base: u16, slot: usize) -> u16 {
@@ -94,6 +96,17 @@ impl Pool {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Re-point every port after the port range moved. The slot stays, so the
+    /// only thing a client sees is that its port number changed.
+    pub fn rebase(&mut self, port_base: u16) {
+        for e in self.exits.iter_mut() {
+            e.port = Self::slot_port(port_base, e.slot);
+        }
+        for r in self.log.iter_mut() {
+            r.port = Self::slot_port(port_base, r.slot);
         }
     }
 

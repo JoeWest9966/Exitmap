@@ -16,6 +16,9 @@ pub struct Sidecar {
     child: Option<Child>,
     pub last_err: String,
     pub config_hash: u64,
+    /// Ports the currently running config binds, so the squat check can tell
+    /// "someone else has it" from "we have it".
+    pub ports: std::collections::HashSet<u16>,
 }
 
 impl Default for Sidecar {
@@ -24,6 +27,7 @@ impl Default for Sidecar {
             child: None,
             last_err: String::new(),
             config_hash: 0,
+            ports: std::collections::HashSet::new(),
         }
     }
 }
@@ -40,9 +44,19 @@ pub struct ExitSlot {
 /// :8083 and burning 32036 as a source port), and one squatted number must not
 /// take the whole rotation down with it — the node behind it is simply skipped
 /// for this round.
-pub fn free_ports(ports: &[u16]) -> std::collections::HashSet<u16> {
+pub fn free_ports(
+    ports: &[u16],
+    ignore: &std::collections::HashSet<u16>,
+) -> std::collections::HashSet<u16> {
     let mut busy = std::collections::HashSet::new();
     for p in ports {
+        // Ports our own sidecar is holding are not "squatted": the check runs
+        // while the old instance is still up, and counting those would declare
+        // the whole table busy and emit an empty config (it did — every port
+        // looked taken by ourselves).
+        if ignore.contains(p) {
+            continue;
+        }
         if std::net::TcpListener::bind(("127.0.0.1", *p)).is_err() {
             busy.insert(*p);
         }
@@ -50,11 +64,49 @@ pub fn free_ports(ports: &[u16]) -> std::collections::HashSet<u16> {
     busy
 }
 
+/// The ports a generated config actually binds.
+pub fn config_ports(conf: &Value) -> std::collections::HashSet<u16> {
+    conf.get("inbounds")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|i| i.get("listen_port").and_then(|p| p.as_u64()))
+                .map(|p| p as u16)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Normalize the exit listener list: empties dropped, duplicates removed, and
+/// an all-interfaces address wins outright (binding 0.0.0.0 plus 127.0.0.1 for
+/// the same port is an EADDRINUSE, not a wider listener).
+pub fn normalize_listen(listen: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in listen {
+        let a = a.trim().to_string();
+        if a.is_empty() {
+            continue;
+        }
+        if a == "0.0.0.0" || a == "::" {
+            return vec![a];
+        }
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    if out.is_empty() {
+        out.push("127.0.0.1".into());
+    }
+    out
+}
+
 pub fn build_config(
     nodes: &[Node],
     probe_base: u16,
     exits: &[ExitSlot],
     busy: &std::collections::HashSet<u16>,
+    exit_listen: &[String],
+    disable_udp: bool,
 ) -> Value {
     let mut inbounds: Vec<Value> = Vec::new();
     let mut outbounds: Vec<Value> = Vec::new();
@@ -77,19 +129,43 @@ pub fn build_config(
     }
 
     // Exposed exits come last so their tags read separately in the file.
+    // One inbound per (exit, listen address): the same port on two addresses is
+    // legal and is exactly how "also reachable on the LAN/tailnet" is built.
+    let listen = normalize_listen(exit_listen);
+    let mut exit_tags: Vec<String> = Vec::new();
     for e in exits {
         if e.node_idx >= nodes.len() || busy.contains(&e.port) {
             continue;
         }
-        inbounds.push(json!({
-            "type": "mixed", // socks5 + http on one port: every client speaks one of them
-            "tag": format!("x{}", e.slot),
-            "listen": "127.0.0.1",
-            "listen_port": e.port as u32,
-        }));
         rules.push(json!({
-            "inbound": [format!("x{}", e.slot)],
+            "inbound": exit_tags_placeholder(e.slot, listen.len()),
             "outbound": format!("o{}", e.node_idx),
+        }));
+        for (ai, addr) in listen.iter().enumerate() {
+            let tag = if ai == 0 {
+                format!("x{}", e.slot)
+            } else {
+                format!("x{}_{ai}", e.slot)
+            };
+            inbounds.push(json!({
+                "type": "mixed", // socks5 + http on one port: every client speaks one of them
+                "tag": tag,
+                "listen": addr,
+                "listen_port": e.port as u32,
+            }));
+            exit_tags.push(tag);
+        }
+    }
+
+    // UDP off: one reject rule ahead of the route rules. In sing-box 1.11+ the
+    // inbound no longer carries `udp`/`network` (removed in 1.13 — writing them
+    // makes `sing-box check` refuse the whole config), so this is the supported
+    // way to keep exit ports TCP-only.
+    if disable_udp && !exit_tags.is_empty() {
+        rules.insert(0, json!({
+            "inbound": exit_tags,
+            "network": ["udp"],
+            "action": "reject",
         }));
     }
 
@@ -100,6 +176,19 @@ pub fn build_config(
         "outbounds": outbounds,
         "route": {"rules": rules, "final": "direct"},
     })
+}
+
+/// Tags for one exit's inbound set, in the same order build_config emits them.
+fn exit_tags_placeholder(slot: usize, addrs: usize) -> Vec<String> {
+    (0..addrs)
+        .map(|ai| {
+            if ai == 0 {
+                format!("x{slot}")
+            } else {
+                format!("x{slot}_{ai}")
+            }
+        })
+        .collect()
 }
 
 fn hash_of(s: &str) -> u64 {
@@ -127,6 +216,15 @@ impl Sidecar {
         cfg: &Value,
         log_path: &Path,
     ) -> Result<bool> {
+        if cfg
+            .get("inbounds")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+        {
+            self.last_err = "生成的配置里一个 inbound 都没有,拒绝启动".into();
+            return Err(anyhow!(self.last_err.clone()));
+        }
         let text = serde_json::to_string_pretty(cfg)?;
         let h = hash_of(&text);
         if h == self.config_hash && self.alive() {
@@ -202,12 +300,29 @@ impl Sidecar {
         }
         self.child = Some(child);
         self.config_hash = h;
+        self.ports = config_ports(cfg);
         self.last_err.clear();
         if !self.alive() {
             self.last_err = "sing-box 启动后立刻退出,看 sing-box.log".to_string();
             return Err(anyhow!(self.last_err.clone()));
         }
         Ok(true)
+    }
+
+    /// Kill sing-box processes still running *our* config file. A manual run
+    /// that got SIGKILLed leaves one behind (PPID 1), and it holds the ports
+    /// forever — found exactly that in testing: an orphan from two hours
+    /// earlier was squatting 31001-31044.
+    pub fn kill_strays(config_path: &std::path::Path) {
+        let pat = format!("sing-box run -c {}", config_path.display());
+        let out = std::process::Command::new("pgrep").arg("-f").arg(&pat).output();
+        if let Ok(o) = out {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                }
+            }
+        }
     }
 
     pub fn stop(&mut self) {

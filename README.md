@@ -53,10 +53,25 @@ zen-gate 也按出口 IP 分组，但三件事和这里要的不一样：
 | `/exits` | 出口端口表 | 端口 / IP / 地区 / 延迟 / 承载节点 / 状态 / 换绑次数；复制地址、钉住/解锁 |
 | `/subs` | 订阅 | 新增（URL 只写不显）/ 删除 |
 | `/log` | 换绑日志 | 每次「端口换 IP」的旧值、新值、时间、原因 |
+| `/config` | 配置 | 端口 / 探测 / 日志三组旋钮，加一个端口与地址体检 |
 
 底部 dock 是 macOS 浮动样式：鼠标靠近哪项哪项放大，tooltip 在项上方，当前页有强调色和圆点。视觉与交互参数照 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) 的 `floating-dock`（MIT，Copyright (c) 2026 WorkBuddy Manager contributors），用原生 JS/CSS 重写 —— 本项目的面板没有 React 也没有构建步骤。
 
 未知路径由后端 SPA fallback 兜到同一个 HTML，`/api/*` 仍然老实返回 404。
+
+### 配置页
+
+每一项右边都标着**什么时候生效**，别猜：
+
+| 徽标 | 意思 |
+|---|---|
+| 下一轮 | 只影响调度/判定，下一轮探活自然用上新值，不断连接 |
+| 重载 sing-box | 要重写侧车配置并重启它，**现有连接会断一下** |
+| 即时 | 按钮类操作，点了就跑 |
+
+`端口段 / 监听地址 / UDP` 这三项变了会弹出二次确认，因为**所有已有客户端都要跟着改**（换端口）或者**协议面变了**（关掉 UDP）。
+
+「体检」按钮做两件事：报出哪些端口正被别的进程占着（占了那个节点本轮会被跳过），以及每个监听地址是不是真的挂在本机上。体检会排除 Exitmap 自己侧车占用的端口 —— 否则它会把整张表报成"全被占"（这个坑真踩过：检测时旧实例还在跑，结果生成了零 inbound 的配置）。
 
 ## 配置
 
@@ -74,6 +89,11 @@ zen-gate 也按出口 IP 分组，但三件事和这里要的不一样：
 | `probeUrl` | `http://api.ipify.org` | 探针地址，返回纯 IP |
 | `probeConcurrency` | `24` | 探测并发 |
 | `singBox` | `/usr/local/bin/sing-box` | 侧车可执行文件 |
+| `exitListen` | `["127.0.0.1"]` | 出口端口绑哪些地址（可多条；`0.0.0.0` 通吃） |
+| `disableUdp` | `false` | 出口端口只走 TCP |
+| `probeFailThreshold` | `2` | 连续失败几次才把节点摘出轮询（1 = 一次就摘） |
+| `maxLatencyMs` | `0` | 超时的出口不上表，0 = 不限 |
+| `logRetentionDays` | `0` | 换绑日志保留天数，0 = 永久 |
 
 状态落在 `/var/lib/exitmap/`：`sing-box.json`（生成的配置）、`sing-box.log`、`state.json`（槽位与换绑历史，重启不洗牌）。
 
@@ -103,6 +123,7 @@ net.ipv4.ip_local_reserved_ports = 18788-18799,21001-21300,31001-31128,32001-324
 2. 防火墙只放行该网段（例如 `ufw allow from 100.64.0.0/10 to any port 18790 proto tcp`）。
 
 **不要把它暴露到公网。** 出口端口是无认证的 socks5/http 代理，谁连上谁的流量就从你的机场出口走。
+把 `exitListen` 加上局域网/Tailscale 地址等于**把这份额度开放给那个网段的所有人** —— 想让别的设备用才加，加了心里要有数。
 
 ## 版权
 
