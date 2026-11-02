@@ -1,0 +1,20 @@
+[package]
+name = "exitmap"
+version = "0.1.0"
+edition = "2021"
+description = "Subscription -> unique egress IP -> one fixed local port per IP"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+url = "2"
+base64 = "0.22"
+sha1 = "0.10"
+percent-encoding = "2"
+anyhow = "1"
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,13 @@
+# 构建产物
+/target
+
+# ── 运行期数据:任何情况下都不进库 ──────────────────────────────
+# 订阅 URL 就是凭据(在 config.json 里),state.json 带真实出口 IP 与
+# 换绑历史(等于把用了哪些机场出口广播出去),sing-box.json 里是节点
+# 服务器地址与密码。这些全在 /etc 与 /var/lib 下,这里再兜一层。
+state.json
+sing-box.json
+sing-box.log
+*.log
+config.json
+*.env

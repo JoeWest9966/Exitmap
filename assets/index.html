@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Exitmap</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><text y='19' font-size='19'>🚪</text></svg>">
+<style>
+:root{
+  --bg:#0a0b0e; --panel:#111318; --panel2:#171a20; --panel3:#1d2129;
+  --line:rgba(225,235,255,.10); --line-soft:rgba(225,235,255,.06);
+  --ink:#eef0f4; --dim:#a8afb8; --mute:rgba(238,240,244,.5);
+  --accent:#6e7bff; --accent-soft:rgba(110,123,255,.16);
+  --ok:#3fdd8b; --ok-soft:rgba(63,221,139,.12);
+  --warn:#f5b544; --warn-soft:rgba(245,181,68,.13);
+  --bad:#f87a7a; --bad-soft:rgba(248,122,122,.12);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --dock-h:76px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.55 ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+header{
+  position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;
+  padding:13px 22px;border-bottom:1px solid var(--line);
+  background:rgba(10,11,14,.82);backdrop-filter:blur(14px);
+}
+.brand{display:flex;align-items:baseline;gap:9px}
+.brand b{font-size:15px;letter-spacing:.01em}
+.brand span{color:var(--mute);font-size:12px}
+.grow{flex:1}
+.chips{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
+  background:var(--panel2);border:1px solid var(--line-soft);font-size:12px;color:var(--dim);
+}
+.chip b{font-family:var(--mono);color:var(--ink);font-weight:600}
+.chip.good{color:var(--ok);background:var(--ok-soft);border-color:transparent}
+.chip.evil{color:var(--bad);background:var(--bad-soft);border-color:transparent}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+button{font:inherit;color:var(--ink);background:var(--panel2);border:1px solid var(--line);
+  border-radius:9px;padding:6px 13px;cursor:pointer;transition:border-color .15s,background .15s}
+button:hover{border-color:rgba(110,123,255,.55)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{filter:brightness(1.08)}
+button.tiny{padding:2px 9px;font-size:12px;border-radius:7px}
+button:disabled{opacity:.45;cursor:default}
+
+main{max-width:1180px;margin:0 auto;padding:22px 22px calc(var(--dock-h) + 40px)}
+.page{display:none;animation:in .18s ease-out}
+.page.on{display:block}
+@keyframes in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+
+.rowhead{display:flex;align-items:center;gap:12px;margin:0 0 14px}
+h2{font-size:17px;margin:0;font-weight:600;letter-spacing:.01em}
+h2 small{font-size:12px;color:var(--mute);font-weight:400;margin-left:8px}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line-soft);font-size:13px;white-space:nowrap}
+th{color:var(--mute);font-weight:500;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;background:var(--panel2)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:rgba(255,255,255,.02)}
+.port{font-family:var(--mono);font-weight:600;color:var(--accent)}
+.ip{font-family:var(--mono)}
+.mono{font-family:var(--mono)}
+.dim{color:var(--mute)}
+.nm{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block}
+
+.badge{display:inline-flex;align-items:center;gap:5px;padding:1px 9px;border-radius:999px;font-size:11.5px}
+.badge.on{color:var(--ok);background:var(--ok-soft)}
+.badge.off{color:var(--bad);background:var(--bad-soft)}
+.badge.pin{color:var(--warn);background:var(--warn-soft)}
+
+.empty{padding:38px 16px;text-align:center;color:var(--mute);font-size:13px}
+
+form.add{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:14px;
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;margin-bottom:14px}
+input{background:#0c0e12;border:1px solid var(--line);color:var(--ink);border-radius:9px;
+  padding:8px 11px;font:inherit;min-width:180px}
+input:focus{outline:none;border-color:rgba(110,123,255,.65)}
+input#surl{min-width:min(420px,100%)}
+.hint{color:var(--mute);font-size:12px}
+.err{color:var(--bad);font-size:12.5px}
+
+ul.log{list-style:none;margin:0;padding:0}
+ul.log li{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;
+  padding:9px 14px;border-bottom:1px solid var(--line-soft);font-size:12.5px}
+ul.log li:last-child{border-bottom:none}
+ul.log .t{font-family:var(--mono);color:var(--mute);min-width:64px}
+ul.log .arrow{color:var(--mute)}
+
+/* ── 底部浮动 dock（视觉照 workbuddy-manager 的 floating-dock，MIT） ── */
+.dock{
+  position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:30;
+  display:flex;align-items:flex-end;gap:10px;
+  padding:8px 12px;border-radius:16px;
+  background:rgba(17,19,24,.72);border:1px solid rgba(225,235,255,.10);
+  box-shadow:0 12px 34px rgba(0,0,0,.45),0 1px 0 rgba(255,255,255,.05) inset;
+  backdrop-filter:blur(14px) saturate(1.3);
+}
+.dock-item{
+  position:relative;display:flex;align-items:center;justify-content:center;
+  width:44px;height:44px;border-radius:999px;
+  background:var(--panel3);color:var(--dim);
+  text-decoration:none;border:none;padding:0;cursor:pointer;
+  transition:width .13s cubic-bezier(.2,.8,.2,1),height .13s cubic-bezier(.2,.8,.2,1),
+             background .15s,color .15s;
+  will-change:width,height;
+}
+.dock-item:hover{background:#232833;color:var(--ink)}
+.dock-item.on{background:var(--accent-soft);color:var(--accent-strong,#8b96ff)}
+.dock-item svg{width:21px;height:21px;transition:width .13s cubic-bezier(.2,.8,.2,1),height .13s cubic-bezier(.2,.8,.2,1);stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.dock-item.on::after{
+  content:"";position:absolute;bottom:3px;left:50%;transform:translateX(-50%);
+  width:4px;height:4px;border-radius:50%;background:currentColor;
+}
+.tip{
+  position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%) translateY(4px);
+  padding:3px 9px;border-radius:7px;font-size:11.5px;white-space:nowrap;
+  background:#20242c;border:1px solid var(--line);color:var(--ink);
+  opacity:0;pointer-events:none;transition:opacity .13s,transform .13s;
+}
+.dock-item:hover .tip{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast{
+  position:fixed;left:50%;bottom:calc(var(--dock-h) + 22px);transform:translate(-50%,8px);
+  background:#20242c;border:1px solid var(--line);color:var(--ink);
+  padding:7px 14px;border-radius:10px;font-size:12.5px;z-index:40;
+  opacity:0;transition:opacity .18s,transform .18s;pointer-events:none;
+}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+
+@media (max-width:720px){
+  header{padding:11px 14px}
+  .brand span{display:none}
+  main{padding:16px 14px calc(var(--dock-h) + 30px)}
+  .card{border-radius:12px;overflow-x:auto}
+  th,td{padding:8px 11px}
+  .dock{gap:7px;padding:7px 10px;bottom:12px}
+  .dock-item{width:40px;height:40px}
+  .dock-item svg{width:19px;height:19px}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>Exitmap</b><span>一个出口 IP = 一个固定端口</span></div>
+  <span class="grow"></span>
+  <div class="chips" id="chips"></div>
+  <button id="refresh">立即刷新</button>
+</header>
+
+<main>
+  <!-- ① 出口端口表 -->
+  <section class="page" id="page-exits">
+    <div class="rowhead">
+      <h2>出口端口表<small>127.0.0.1:端口 就是那个出口 IP，socks5 与 http 同端口</small></h2>
+      <span class="grow"></span>
+      <span class="hint" id="exits-meta"></span>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>端口</th><th>出口 IP</th><th>地区</th><th>延迟</th><th>承载节点</th><th>状态</th><th>换绑</th><th></th>
+        </tr></thead>
+        <tbody id="exits"><tr><td colspan="8" class="empty">读取中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ② 订阅 -->
+  <section class="page" id="page-subs">
+    <div class="rowhead">
+      <h2>订阅<small>URL 即凭据，只写不显</small></h2>
+    </div>
+    <form class="add" id="addform">
+      <input id="sname" placeholder="名字（如 主订阅）" autocomplete="off">
+      <input id="surl" placeholder="订阅 URL" autocomplete="off">
+      <button class="primary" type="submit">新增</button>
+      <span class="hint" id="addmsg"></span>
+    </form>
+    <div class="card">
+      <table>
+        <thead><tr><th>名字</th><th>地址</th><th>状态</th><th></th></tr></thead>
+        <tbody id="subs"><tr><td colspan="4" class="empty">读取中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ③ 换绑日志 -->
+  <section class="page" id="page-log">
+    <div class="rowhead">
+      <h2>换绑日志<small>端口换 IP 的记录：谁换的、换到哪、什么时候</small></h2>
+      <span class="grow"></span>
+      <span class="hint" id="log-meta"></span>
+    </div>
+    <div class="card">
+      <ul class="log" id="log"><li class="empty">还没有记录</li></ul>
+    </div>
+  </section>
+</main>
+
+<nav class="dock" id="dock" aria-label="页面切换"></nav>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ms = t => t ? new Date(t).toLocaleTimeString("zh-CN", {hour12:false}) : "—";
+const ago = t => { if(!t) return "—"; const s = Math.round((Date.now()-t)/1000);
+  if(s<60) return s+"s 前"; const m=Math.round(s/60); if(m<60) return m+"m 前"; return Math.round(m/60)+"h 前"; };
+
+// ── 页面路由：真 URL，不整页刷新 ───────────────────────────────────────────
+const PAGES = [
+  {path:"/exits", title:"出口端口表", icon:`<svg viewBox="0 0 24 24"><path d="M14 3h5a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-5"/><path d="M10 12H3"/><path d="m6 9-3 3 3 3"/></svg>`},
+  {path:"/subs",  title:"订阅",      icon:`<svg viewBox="0 0 24 24"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.4"/></svg>`},
+  {path:"/log",   title:"换绑日志",  icon:`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 1.9"/></svg>`},
+];
+const resolve = p => (PAGES.find(x => x.path === p) ? p : "/exits");
+
+function renderDock(){
+  const cur = resolve(location.pathname);
+  $("#dock").innerHTML = PAGES.map(p => `
+    <a class="dock-item ${p.path===cur?"on":""}" href="${p.path}" data-path="${p.path}" aria-label="${p.title}" aria-current="${p.path===cur?"page":"false"}">
+      ${p.icon}<span class="tip">${p.title}</span>
+    </a>`).join("");
+}
+
+function show(path, push){
+  const cur = resolve(path);
+  for(const p of PAGES) $("#page-" + p.path.slice(1)).classList.toggle("on", p.path === cur);
+  if(push && location.pathname !== cur) history.pushState({}, "", cur);
+  renderDock();
+  document.title = "Exitmap · " + (PAGES.find(p=>p.path===cur)||PAGES[0]).title;
+}
+
+document.addEventListener("click", ev => {
+  const a = ev.target.closest("a[data-path]");
+  if(!a || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button !== 0) return;
+  ev.preventDefault();
+  show(a.dataset.path, true);
+});
+window.addEventListener("popstate", () => show(location.pathname, false));
+
+// ── dock 放大：光标离哪项近哪项长大（视觉照 workbuddy-manager，MIT）──────
+(() => {
+  const dock = $("#dock");
+  let raf = 0, lx = null;
+  const NEAR = 150, BASE = 44, MAX = 68, IB = 21, IM = 34;
+  const apply = () => {
+    raf = 0;
+    for(const el of dock.children){
+      if(lx === null){ el.style.width = el.style.height = ""; const s = el.querySelector("svg"); if(s){s.style.width="";s.style.height="";} continue; }
+      const r = el.getBoundingClientRect();
+      const d = lx - (r.left + r.width / 2);
+      const t = Math.max(0, 1 - Math.abs(d) / NEAR);           // 0..1
+      const k = t * t * (3 - 2 * t);                            // smoothstep
+      const size = BASE + (MAX - BASE) * k;
+      el.style.width = el.style.height = size + "px";
+      const s = el.querySelector("svg");
+      if(s){ const is = IB + (IM - IB) * k; s.style.width = s.style.height = is + "px"; }
+    }
+  };
+  dock.addEventListener("mousemove", e => { lx = e.clientX; if(!raf) raf = requestAnimationFrame(apply); });
+  dock.addEventListener("mouseleave", () => { lx = null; if(!raf) raf = requestAnimationFrame(apply); });
+})();
+
+// 复制：http:// 下不是安全上下文，navigator.clipboard 直接不可用（会抛），
+// 所以必须有 execCommand 兜底 —— 面板是通过 tailnet 的 http 打开的。
+async function copyText(t){
+  try{
+    if(navigator.clipboard && window.isSecureContext){ await navigator.clipboard.writeText(t); return true; }
+  }catch(e){}
+  const ta = document.createElement("textarea");
+  ta.value = t; ta.setAttribute("readonly","");
+  ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+  document.body.appendChild(ta); ta.select();
+  let ok = false;
+  try{ ok = document.execCommand("copy"); }catch(e){}
+  ta.remove();
+  return ok;
+}
+
+// ── toast ─────────────────────────────────────────────────────────────────
+let toastT = 0;
+function toast(msg){
+  const t = $("#toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("on"), 1600);
+}
+
+// ── 数据 ──────────────────────────────────────────────────────────────────
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const txt = await r.text();
+  if(!r.ok) throw new Error(txt || r.statusText);
+  return (txt && txt !== "ok" && txt !== "queued") ? JSON.parse(txt) : null;
+}
+
+function chips(s, exits){
+  // 数字取自 exits 数组而不是 status:status 在重启后要等一轮跑完才有值,
+  // 那时候表里明明有行、头上却写着 0。
+  const open = exits.filter(e => e.alive).length;
+  $("#chips").innerHTML = [
+    `<span class="chip">出口 <b>${open}</b></span>`,
+    `<span class="chip">端口 <b>${open}</b></span>`,
+    `<span class="chip">探活 <b>${s.probesOk}/${s.nodes}</b></span>`,
+    s.singboxAlive ? `<span class="chip good"><i class="dot"></i>sing-box</span>`
+                   : `<span class="chip evil"><i class="dot"></i>sing-box 挂了</span>`,
+  ].join("");
+  if(s.lastError) $("#chips").innerHTML += `<span class="chip evil" title="${esc(s.lastError)}">错误</span>`;
+}
+
+function renderExits(exits){
+  const tb = $("#exits");
+  if(!exits.length){ tb.innerHTML = `<tr><td colspan="8" class="empty">还没有出口 —— 等第一轮探测完成，或先加一条订阅。</td></tr>`; return; }
+  tb.innerHTML = exits.map(e => `
+    <tr>
+      <td><span class="port">${e.port}</span></td>
+      <td class="ip">${esc(e.ip)}</td>
+      <td>${esc(e.country || "—")}</td>
+      <td class="mono ${e.latencyMs > 1500 ? "dim" : ""}">${e.latencyMs}ms</td>
+      <td><span class="nm dim" title="${esc(e.nodeName)}">${esc(e.nodeName || "")}</span></td>
+      <td>${e.alive ? '<span class="badge on"><i class="dot"></i>在轮询</span>'
+                    : '<span class="badge off"><i class="dot"></i>端口关闭</span>'}${e.pinned ? ' <span class="badge pin">钉住</span>' : ''}</td>
+      <td class="dim mono">${e.rebinds ? e.rebinds + " 次" : "—"}<br>${e.alive ? `<span title="该 IP 从什么时候开始占这个端口">${ago(e.sinceMs)}</span>` : ""}</td>
+      <td><button class="tiny" data-copy="${e.port}">复制</button>
+          <button class="tiny" data-pin="${e.slot}" data-to="${e.pinned ? "false" : "true"}">${e.pinned ? "解锁" : "钉住"}</button></td>
+    </tr>`).join("");
+  tb.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
+    const addr = "127.0.0.1:" + b.dataset.copy;
+    const ok = await copyText(addr);
+    if(ok){ b.textContent = "已复制"; setTimeout(() => b.textContent = "复制", 1200); }
+    toast(ok ? "已复制 " + addr : "复制失败，手动选：" + addr);
+  });
+  tb.querySelectorAll("[data-pin]").forEach(b => b.onclick = async () => {
+    try{
+      await api(`/api/exits/${b.dataset.pin}/pin`, {method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({pinned: b.dataset.to === "true"})});
+      toast(b.dataset.to === "true" ? "已钉住：该端口不会换 IP" : "已解锁");
+      load();
+    }catch(e){ toast("操作失败: " + e.message); }
+  });
+}
+
+function renderSubs(subs){
+  const tb = $("#subs");
+  tb.innerHTML = subs.length ? subs.map(s => `
+    <tr>
+      <td>${esc(s.name)}</td>
+      <td class="mono dim">${esc(s.urlMasked)}</td>
+      <td>${s.enabled ? '<span class="badge on"><i class="dot"></i>启用</span>' : '<span class="badge off">停用</span>'}</td>
+      <td><button class="tiny" data-del="${esc(s.id)}">删除</button></td>
+    </tr>`).join("") : `<tr><td colspan="4" class="empty">还没有订阅</td></tr>`;
+  tb.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
+    if(!confirm("删掉这条订阅？")) return;
+    try{ await api("/api/subscriptions/" + encodeURIComponent(b.dataset.del), {method:"DELETE"}); toast("已删除"); load(); }
+    catch(e){ toast("删除失败: " + e.message); }
+  });
+}
+
+function renderLog(log){
+  const ul = $("#log");
+  ul.innerHTML = log.length ? log.map(r => `
+    <li>
+      <span class="t">${ms(r.atMs)}</span>
+      <span class="port">${r.port}</span>
+      <span>${r.fromIp ? esc(r.fromIp) : "—"} <span class="arrow">→</span> ${r.toIp ? esc(r.toIp) : "<span class=dim>(端口关闭)</span>"}</span>
+      <span class="dim">${esc(r.reason)}</span>
+    </li>`).join("") : `<li class="empty">还没有记录</li>`;
+}
+
+async function load(){
+  try{
+    const d = await api("/api/state");
+    chips(d.status, d.exits || []);
+    renderExits(d.exits || []);
+    renderSubs(d.subscriptions || []);
+    renderLog(d.log || []);
+    $("#exits-meta").textContent = `端口 ${d.portBase}–${d.portBase + d.maxExits - 1} · 每 ${d.refreshMinutes} 分钟探活 · 每 ${d.subFetchMinutes} 分钟拉订阅`;
+    $("#log-meta").textContent = `共 ${(d.log || []).length} 条`;
+  }catch(e){
+    $("#chips").innerHTML = `<span class="chip evil">读状态失败: ${esc(e.message)}</span>`;
+  }
+}
+
+$("#refresh").onclick = async () => {
+  const b = $("#refresh"); b.disabled = true; b.textContent = "已排队…";
+  try{ await api("/api/refresh", {method:"POST"}); toast("已触发刷新，一轮约 1 分钟"); }
+  catch(e){ toast(e.message); }
+  setTimeout(() => { b.disabled = false; b.textContent = "立即刷新"; load(); }, 1200);
+};
+
+$("#addform").onsubmit = async ev => {
+  ev.preventDefault();
+  const url = $("#surl").value.trim(), name = $("#sname").value.trim();
+  $("#addmsg").textContent = "";
+  try{
+    await api("/api/subscriptions", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name,url})});
+    $("#surl").value = ""; $("#sname").value = "";
+    $("#addmsg").textContent = "已加入，正在拉取…"; toast("订阅已加入");
+    setTimeout(load, 1500);
+  }catch(e){ $("#addmsg").textContent = "失败: " + e.message; }
+};
+
+show(location.pathname, false);
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

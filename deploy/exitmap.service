@@ -1,0 +1,16 @@
+[Unit]
+Description=exitmap — subscription -> unique egress IP -> one fixed local port per IP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/Exitmap/target/release/exitmap
+Environment=EXITMAP_CONFIG=/etc/exitmap/config.json
+Restart=always
+RestartSec=5
+# sing-box is a child process: keep it in the same cgroup so a stop takes it too.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
