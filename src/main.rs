@@ -74,6 +74,9 @@ struct Config {
     /// private interface (LAN / tailnet) is the point.
     exit_listen: Vec<String>,
     max_exits: usize,
+    /// Country → port reservations, `"JP=31001-31020, US=31021-31040"`.
+    /// Empty = every slot is a free-for-all (the pre-feature behaviour).
+    country_slots: String,
     /// TCP only on exit ports (UDP is rejected by a route rule).
     disable_udp: bool,
     /// Cap on candidates probed per round. 0 = no cap.
@@ -105,6 +108,7 @@ impl Default for Config {
             probe_base: 32001,
             exit_listen: vec!["127.0.0.1".into()],
             max_exits: 128,
+            country_slots: String::new(),
             disable_udp: false,
             max_probe_nodes: 200,
             probe_fail_threshold: 2,
@@ -394,6 +398,15 @@ impl App {
     /// Country codes for IPs we have never seen. ip-api.com's free tier allows
     /// 45 requests/min per source address, and one round only ever needs the
     /// fresh IPs, so a few dozen lookups per round is comfortably inside it.
+    /// Country codes for IPs we have never seen. ip-api.com's free tier allows
+    /// 45 requests/min per source address, and one round only ever needs the
+    /// fresh IPs, so a few dozen lookups per round is comfortably inside it.
+    ///
+    /// Two rules matter for country port blocks:
+    ///   * a failed lookup is NOT cached — caching "" would make the IP
+    ///     countryless forever and it could never enter its reserved block;
+    ///   * lookups run concurrently, because this sits in front of reconcile
+    ///     and 40 sequential 6s timeouts would stall a round for minutes.
     async fn fill_countries(&self, ips: &[String]) {
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(6))
@@ -411,17 +424,43 @@ impl App {
                 }
             }
         }
-        for ip in todo.into_iter().take(40) {
-            let url = format!("http://ip-api.com/json/{ip}?fields=status,countryCode");
-            let mut cc = String::new();
-            if let Ok(resp) = client.get(&url).send().await {
-                if let Ok(v) = resp.json::<Value>().await {
-                    if let Some(s) = v.get("countryCode").and_then(|c| c.as_str()) {
-                        cc = s.to_string();
-                    }
+        todo.truncate(40);
+        if todo.is_empty() {
+            return;
+        }
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut set = tokio::task::JoinSet::new();
+        for ip in todo {
+            let client = client.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire().await.ok()?;
+                let url = format!("http://ip-api.com/json/{ip}?fields=status,countryCode");
+                let v = client.get(&url).send().await.ok()?.json::<Value>().await.ok()?;
+                let cc = v
+                    .get("countryCode")
+                    .and_then(|c| c.as_str())?
+                    .trim()
+                    .to_uppercase();
+                if cc.is_empty() {
+                    return None;
                 }
+                Some((ip, cc))
+            });
+        }
+        let mut found: Vec<(String, String)> = Vec::new();
+        while let Some(r) = set.join_next().await {
+            if let Ok(Some(kv)) = r {
+                found.push(kv);
             }
-            self.inner.write().await.pool.countries.insert(ip, cc);
+        }
+        if found.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        for (ip, cc) in found {
+            inner.pool.countries.insert(ip, cc);
         }
     }
 
@@ -607,12 +646,25 @@ impl App {
         }
 
         // ── 6. reconcile: hand each IP a stable port ──────────────────────
-        let changed = {
+        // Blocks are re-parsed every round: the operator can edit them from the
+        // panel and the very next round has to honour the change. Validation
+        // already ran on save, so a parse error here means a hand-edited config
+        // and the safe answer is "no reservations".
+        let blocks = pool::parse_country_slots(&cfg.country_slots, cfg.port_base, cfg.max_exits)
+            .unwrap_or_default();
+        let rec = {
             let mut inner = self.inner.write().await;
             inner
                 .pool
-                .reconcile(&live, cfg.port_base, cfg.max_exits, now)
+                .reconcile(&live, cfg.port_base, cfg.max_exits, &blocks, now)
         };
+        let changed = rec.changed;
+        if rec.dropped > 0 {
+            eprintln!(
+                "[exitmap] {} 个出口 IP 没抢到空槽位,本轮不上表",
+                rec.dropped
+            );
+        }
 
         // ── 7. apply routing changes + book the round ─────────────────────
         if changed {
@@ -955,7 +1007,27 @@ async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
             })
         })
         .collect();
-    let exits: Vec<&ExitView> = inner.pool.exits.iter().collect();
+    let exits: Vec<Value> = {
+        // `slotCountry` is derived, not stored: the pin lives in `countrySlots`,
+        // so there is exactly one source of truth and no state migration.
+        let blocks = pool::parse_country_slots(&cfg.country_slots, cfg.port_base, cfg.max_exits)
+            .unwrap_or_default();
+        inner
+            .pool
+            .exits
+            .iter()
+            .map(|e| {
+                let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert(
+                        "slotCountry".into(),
+                        json!(pool::block_cc(&blocks, e.slot).unwrap_or("")),
+                    );
+                }
+                v
+            })
+            .collect()
+    };
     let log: Vec<&Rebind> = inner.pool.log.iter().take(60).collect();
     Json(json!({
         "status": status,
@@ -1040,6 +1112,68 @@ async fn api_refresh(State(app): State<Arc<App>>) -> Response {
     (StatusCode::OK, "queued").into_response()
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct CountryPin {
+    country: String,
+}
+
+/// Per-port country pin. Writes the same `countrySlots` string the range editor
+/// writes, so the button and the textarea can never disagree.
+async fn api_pin_country(
+    State(app): State<Arc<App>>,
+    Path(port): Path<u16>,
+    Json(body): Json<CountryPin>,
+) -> Response {
+    let cfg = app.cfg.read().await.clone();
+    let cc = body.country.trim().to_ascii_uppercase();
+    let slots = match pool::set_slot_country(&cfg.country_slots, port, &cc, cfg.port_base, cfg.max_exits)
+    {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let blocks = pool::parse_country_slots(&slots, cfg.port_base, cfg.max_exits).unwrap_or_default();
+    let slot = (port - cfg.port_base) as usize;
+
+    // Config first: the worker re-reads it, and save_config must not fail after
+    // we have already moved rows around in memory.
+    {
+        let mut c = app.cfg.write().await;
+        c.country_slots = slots.clone();
+        if let Err(e) = save_config(&c) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
+        }
+    }
+
+    let (closed, filled) = {
+        let mut inner = app.inner.write().await;
+        let closed = inner.pool.drop_ineligible(&blocks, now_ms());
+        let filled = inner.pool.fill_slot(slot, &cc, &blocks, cfg.port_base, now_ms());
+        (closed, filled)
+    };
+    let note = if !cc.is_empty() {
+        match (filled, closed) {
+            (Some(ip), _) => format!("{port} 现在固定 {cc}，已把 {ip} 换进来"),
+            (None, 0) => format!("{port} 现在固定 {cc}"),
+            (None, _) => format!("{port} 现在固定 {cc}，眼下没有空闲的 {cc} 出口，端口暂时关着"),
+        }
+    } else {
+        format!("{port} 已取消国家固定")
+    };
+
+    // Something left its port and something else may need one: let the worker
+    // re-place the orphan now instead of in five minutes.
+    app.wake.notify_one();
+    if let Err(e) = app.apply_config().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("已保存，但 sing-box 重新加载失败: {e}"),
+        )
+            .into_response();
+    }
+    Json(json!({"ok": true, "countrySlots": slots, "note": note})).into_response()
+}
+
 // ── 配置面 ──────────────────────────────────────────────────────────────────
 
 /// Anything the panel may change. Deliberately a separate shape from Config:
@@ -1051,6 +1185,7 @@ struct ConfigPatch {
     port_base: Option<u16>,
     exit_listen: Option<Vec<String>>,
     max_exits: Option<usize>,
+    country_slots: Option<String>,
     disable_udp: Option<bool>,
     refresh_minutes: Option<u64>,
     sub_fetch_minutes: Option<u64>,
@@ -1070,6 +1205,7 @@ fn public_config(c: &Config) -> Value {
         "probeBase": c.probe_base,
         "exitListen": c.exit_listen,
         "maxExits": c.max_exits,
+        "countrySlots": c.country_slots,
         "disableUdp": c.disable_udp,
         "refreshMinutes": c.refresh_minutes,
         "subFetchMinutes": c.sub_fetch_minutes,
@@ -1103,6 +1239,10 @@ fn validate_config(c: &Config) -> Result<(), String> {
             c.port_base, c.max_exits
         ));
     }
+    // Country reservations must live inside the exit range and not overlap: a
+    // bad block would strand slots or, worse, point at someone else's ports.
+    pool::parse_country_slots(&c.country_slots, c.port_base, c.max_exits)
+        .map_err(|e| format!("国家端口段: {e}"))?;
     let probe_end = c.probe_base as u32 + c.max_probe_nodes.max(1) as u32;
     let exit_start = c.port_base as u32;
     if exit_start < probe_end && (c.probe_base as u32) < exit_end {
@@ -1174,6 +1314,9 @@ async fn api_patch_config(
     if let Some(v) = p.max_exits {
         c.max_exits = v;
     }
+    if let Some(v) = p.country_slots {
+        c.country_slots = v.trim().to_string();
+    }
     if let Some(v) = p.disable_udp {
         c.disable_udp = v;
     }
@@ -1212,8 +1355,21 @@ async fn api_patch_config(
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
 
+    // Absolute port blocks and a moving portBase cannot both win: shifting the
+    // base would leave every block pointing at the wrong ports. Clearing the
+    // blocks first is the only sane order.
+    if c.port_base != old.port_base && !c.country_slots.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "改端口段起点前先清空国家端口段,否则段会指到错误的位置",
+        )
+            .into_response();
+    }
+
     let ports_moved = c.port_base != old.port_base;
+    let slots_changed = c.country_slots != old.country_slots;
     let needs_singbox = ports_moved
+        || slots_changed
         || c.exit_listen != old.exit_listen
         || c.disable_udp != old.disable_udp
         || c.max_exits != old.max_exits;
@@ -1221,6 +1377,17 @@ async fn api_patch_config(
     *app.cfg.write().await = c.clone();
     if ports_moved {
         app.inner.write().await.pool.rebase(c.port_base);
+    }
+    if slots_changed {
+        // Free every exit that the new blocks make illegal, then wake the
+        // worker so it re-places those IPs now instead of in five minutes.
+        let blocks = pool::parse_country_slots(&c.country_slots, c.port_base, c.max_exits)
+            .unwrap_or_default();
+        let closed = app.inner.write().await.pool.drop_ineligible(&blocks, now_ms());
+        if closed > 0 {
+            eprintln!("[exitmap] 国家端口段变了,{closed} 个端口先关掉,马上重新分配");
+        }
+        app.wake.notify_one();
     }
     if let Err(e) = save_config(&c) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
@@ -1390,6 +1557,7 @@ async fn main() -> Result<()> {
         .route("/api/subscriptions", post(api_add_sub))
         .route("/api/subscriptions/{id}", delete(api_del_sub))
         .route("/api/exits/{slot}/pin", post(api_pin))
+        .route("/api/exits/{port}/country", post(api_pin_country))
         .route("/api/refresh", post(api_refresh))
         .route("/api/config", get(api_config).patch(api_patch_config))
         .route("/api/diag/ports", post(api_diag_ports))

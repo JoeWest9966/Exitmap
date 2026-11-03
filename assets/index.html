@@ -255,6 +255,19 @@ pre.snip{background:#0b0d11;border:1px solid var(--line);border-radius:9px;paddi
 }
 .toast.on{opacity:1;transform:translate(-50%,0)}
 
+/* 端口固定国家的小弹窗 */
+.modal{position:fixed;inset:0;display:none;place-items:center;background:rgba(0,0,0,.58);z-index:60;padding:18px}
+.modal.on{display:grid}
+.modal-card{width:min(460px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  box-shadow:0 18px 50px rgba(0,0,0,.5);padding:16px 18px}
+.modal-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.modal-head b{font-size:14px;font-weight:600}
+.modal-head .grow{flex:1}
+.cc-grid{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.cc-row{display:flex;gap:8px;align-items:center;margin-top:4px}
+.cc-row input{min-width:0;flex:1;text-transform:uppercase}
+.modal-foot{display:flex;justify-content:flex-end;margin-top:12px}
+
 @media (max-width:720px){
   header{padding:11px 14px}
   .brand span{display:none}
@@ -440,6 +453,11 @@ pre.snip{background:#0b0d11;border:1px solid var(--line);border-radius:9px;paddi
           <div class="cfg-ctl"><input type="number" id="cfg-maxExits" min="1" max="512"></div>
         </div>
         <div class="cfg-row">
+          <div><div class="cfg-label">国家端口段<span class="eff reload">重载 sing-box</span></div>
+            <div class="cfg-hint">把端口按国家钉死：<code>JP=31001-31020</code> 表示 31001–31020 只给日本出口，日本 IP 死光了这些口就空着，绝不拿别国 IP 顶。没写进这里的国家只能用剩下的自由端口。逗号或换行分隔，两种行尾都行；保存后会立刻重排一次，那几个口会断一下。</div></div>
+          <div class="cfg-ctl"><textarea id="cfg-countrySlots" spellcheck="false" placeholder="JP=31001-31020&#10;US=31021-31040"></textarea></div>
+        </div>
+        <div class="cfg-row">
           <div><div class="cfg-label">关掉 UDP<span class="eff reload">重载 sing-box</span></div>
             <div class="cfg-hint">出口端口只走 TCP。有些客户端或上游对 UDP 有问题时打开。</div></div>
           <div class="cfg-ctl"><label class="switch"><input type="checkbox" id="cfg-disableUdp"><span>仅 TCP</span></label></div>
@@ -519,6 +537,25 @@ pre.snip{background:#0b0d11;border:1px solid var(--line);border-radius:9px;paddi
 </main>
 
 <nav class="dock" id="dock" aria-label="页面切换"></nav>
+
+<div class="modal" id="cc-modal" aria-hidden="true">
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <b id="cc-title">固定国家</b><span class="grow"></span>
+      <button class="x" id="cc-close" title="关闭">×</button>
+    </div>
+    <div class="hint" id="cc-hint"></div>
+    <div class="cc-grid" id="cc-grid"></div>
+    <div class="cc-row">
+      <input id="cc-input" maxlength="3" placeholder="两位国家码，如 JP" spellcheck="false" autocomplete="off">
+      <button class="tiny primary" id="cc-apply">固定</button>
+    </div>
+    <div class="modal-foot">
+      <button class="tiny" id="cc-clear">不固定（取消）</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -638,20 +675,22 @@ function chips(s, exits){
 }
 
 function renderExits(exits){
+  LAST_EXITS = exits || [];
   const tb = $("#exits");
   if(!exits.length){ tb.innerHTML = `<tr><td colspan="8" class="empty">还没有出口 —— 等第一轮探测完成，或先加一条订阅。</td></tr>`; return; }
   tb.innerHTML = exits.map(e => `
     <tr>
       <td><span class="port">${e.port}</span></td>
       <td class="ip">${esc(e.ip)}</td>
-      <td>${esc(e.country || "—")}</td>
+      <td>${esc(e.country || "—")}${e.slotCountry ? ` <span class="badge pin" title="这个端口只接 ${esc(e.slotCountry)} 的出口">🔒 ${esc(e.slotCountry)}</span>` : ""}</td>
       <td class="mono ${e.latencyMs > 1500 ? "dim" : ""}">${e.latencyMs}ms</td>
       <td><span class="nm dim" title="${esc(e.nodeName)}">${esc(e.nodeName || "")}</span></td>
       <td>${e.alive ? '<span class="badge on"><i class="dot"></i>在轮询</span>'
                     : '<span class="badge off"><i class="dot"></i>端口关闭</span>'}${e.pinned ? ' <span class="badge pin">钉住</span>' : ''}</td>
       <td class="dim mono">${e.rebinds ? e.rebinds + " 次" : "—"}<br>${e.alive ? `<span title="该 IP 从什么时候开始占这个端口">${ago(e.sinceMs)}</span>` : ""}</td>
       <td><button class="tiny" data-copy="${e.port}">复制</button>
-          <button class="tiny" data-pin="${e.slot}" data-to="${e.pinned ? "false" : "true"}">${e.pinned ? "解锁" : "钉住"}</button></td>
+          <button class="tiny" data-pin="${e.slot}" data-to="${e.pinned ? "false" : "true"}">${e.pinned ? "解锁" : "钉住"}</button>
+          <button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button></td>
     </tr>`).join("");
   tb.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
     const addr = "127.0.0.1:" + b.dataset.copy;
@@ -667,7 +706,63 @@ function renderExits(exits){
       load();
     }catch(e){ toast("操作失败: " + e.message); }
   });
+  tb.querySelectorAll("[data-cc]").forEach(b => b.onclick = () =>
+    openCountryModal(Number(b.dataset.cc), b.dataset.cur, LAST_EXITS));
 }
+
+// ── 端口固定国家 ─────────────────────────────────────────────────────────
+// 只改 countrySlots 里的一条（那一格），和配置页那个文本框是同一份数据。
+let LAST_EXITS = [];
+let CC_PORT = null;
+
+function countryOptions(exits){
+  const n = new Map();
+  for(const e of (exits || [])) if(e.country) n.set(e.country, (n.get(e.country) || 0) + 1);
+  return [...n.entries()].sort((a,b) => b[1]-a[1] || a[0].localeCompare(b[0])).map(x => x[0]);
+}
+function openCountryModal(port, current, exits){
+  CC_PORT = port;
+  const cur = current || "";
+  $("#cc-title").textContent = "端口 " + port + " 固定到哪个国家";
+  $("#cc-hint").innerHTML = cur
+    ? `现在固定 <b>${esc(cur)}</b>：这个端口只接 ${esc(cur)} 的出口；一个都没有时端口就关着，绝不换成别国。`
+    : `现在不固定（谁快谁上）。选定后这个端口只接该国的出口 IP；该国出口全死时端口关闭，不会偷偷换成别国。`;
+  $("#cc-grid").innerHTML = countryOptions(exits).map(c =>
+    `<button class="tiny ${c===cur?"primary":""}" data-pick="${esc(c)}">${esc(c)}</button>`).join("")
+    || `<span class="dim">表里还没有国家数据</span>`;
+  $("#cc-grid").querySelectorAll("[data-pick]").forEach(b => b.onclick = () => applyCountry(b.dataset.pick));
+  $("#cc-input").value = cur;
+  $("#cc-clear").style.display = cur ? "" : "none";
+  $("#cc-modal").classList.add("on");
+  $("#cc-modal").setAttribute("aria-hidden", "false");
+  const i = $("#cc-input"); i.focus(); i.select();
+}
+function closeCountryModal(){
+  CC_PORT = null;
+  $("#cc-modal").classList.remove("on");
+  $("#cc-modal").setAttribute("aria-hidden", "true");
+}
+async function applyCountry(cc){
+  if(CC_PORT === null) return;
+  const port = CC_PORT;
+  try{
+    const r = await api(`/api/exits/${port}/country`, {method:"POST",
+      headers:{"content-type":"application/json"}, body:JSON.stringify({country: cc})});
+    closeCountryModal();
+    toast(r.note || "已保存");
+    load();
+  }catch(e){ toast("操作失败: " + e.message); }
+}
+$("#cc-close").onclick = closeCountryModal;
+$("#cc-clear").onclick = () => applyCountry("");
+$("#cc-apply").onclick = () => applyCountry($("#cc-input").value.trim());
+$("#cc-input").addEventListener("keydown", ev => {
+  if(ev.key === "Enter"){ ev.preventDefault(); applyCountry($("#cc-input").value.trim()); }
+});
+$("#cc-modal").addEventListener("click", ev => { if(ev.target === $("#cc-modal")) closeCountryModal(); });
+document.addEventListener("keydown", ev => {
+  if(ev.key === "Escape" && $("#cc-modal").classList.contains("on")) closeCountryModal();
+});
 
 // 订阅卡片列表(左列)。节点数就是这条订阅这一轮贡献了多少个候选节点。
 function renderSubList(subs){
@@ -752,7 +847,7 @@ $("#sub-add").onsubmit = async ev => {
 
 // ── 配置页 ────────────────────────────────────────────────────────────────
 const CFG_FIELDS = {
-  portBase:"number", exitListen:"lines", maxExits:"number", disableUdp:"bool",
+  portBase:"number", exitListen:"lines", maxExits:"number", countrySlots:"text", disableUdp:"bool",
   refreshMinutes:"number", subFetchMinutes:"number", probeUrl:"text",
   probeTimeoutMs:"number", probeConcurrency:"number", maxProbeNodes:"number",
   probeFailThreshold:"number", maxLatencyMs:"number", logRetentionDays:"number",
@@ -799,6 +894,8 @@ function warnDanger(){
   if(JSON.stringify(now.exitListen) !== JSON.stringify(CFG_BASE.exitListen))
     changes.push(`监听地址 ${(CFG_BASE.exitListen||[]).join(",") || "—"} → ${now.exitListen.join(",") || "—"}`);
   if(now.disableUdp !== CFG_BASE.disableUdp) changes.push(now.disableUdp ? "改成只走 TCP" : "恢复允许 UDP");
+  if((now.countrySlots||"") !== (CFG_BASE.countrySlots||""))
+    changes.push(`国家端口段 ${CFG_BASE.countrySlots|| "（无）"} → ${now.countrySlots|| "（无）"}`);
   if(changes.length){ w.classList.add("on"); w.innerHTML = "⚠ 会打断现有客户端：" + esc(changes.join("；")); }
   else w.classList.remove("on");
 }
@@ -814,7 +911,7 @@ $("#cfg-save").onclick = async () => {
     if(JSON.stringify(now[k]) !== JSON.stringify(CFG_BASE[k])) patch[k] = now[k];
   }
   if(!Object.keys(patch).length){ toast("没有改动"); return; }
-  const risky = ["portBase","exitListen","disableUdp"].filter(k => k in patch);
+  const risky = ["portBase","exitListen","disableUdp","countrySlots"].filter(k => k in patch);
   if(risky.length && !confirm("这些改动会打断现有客户端：" + risky.join(", ") + "\n\n确定保存？")) return;
   const b = $("#cfg-save"); b.disabled = true; b.textContent = "保存中…";
   try{
