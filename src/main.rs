@@ -33,6 +33,26 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 const PANEL: &str = include_str!("../assets/index.html");
 
+fn default_clash_api_port() -> u16 {
+    18791
+}
+
+/// 32 hex chars from /dev/urandom. The control port is loopback-only, but a
+/// guessable secret would still let anything on the box re-point your exits.
+fn random_secret() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_ok();
+    if !ok {
+        let t = format!("{}-{}", now_ms(), std::process::id());
+        b[..8].copy_from_slice(&(t.len() as u64).to_le_bytes());
+        b[8..].copy_from_slice(&now_ms().to_le_bytes());
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -70,6 +90,10 @@ struct Config {
     port_base: u16,
     /// First probe-only inbound. One per candidate node, never exposed.
     probe_base: u16,
+    /// Loopback port for sing-box's Clash API. It is how an exit port is
+    /// re-pointed at another node without restarting the sidecar.
+    #[serde(default = "default_clash_api_port")]
+    clash_api_port: u16,
     /// Where exit ports listen. Multiple addresses allowed: loopback plus a
     /// private interface (LAN / tailnet) is the point.
     exit_listen: Vec<String>,
@@ -106,6 +130,7 @@ impl Default for Config {
             listen: "127.0.0.1:18790".into(),
             port_base: 31001,
             probe_base: 32001,
+            clash_api_port: default_clash_api_port(),
             exit_listen: vec!["127.0.0.1".into()],
             max_exits: 128,
             country_slots: String::new(),
@@ -208,6 +233,10 @@ struct App {
     cfg: RwLock<Config>,
     inner: RwLock<Inner>,
     sidecar: Mutex<singbox::Sidecar>,
+    /// Control channel into the running sidecar. Generated per process: it only
+    /// ever listens on loopback, and a restart of exitmap rewrites the config
+    /// anyway, so there is nothing to persist.
+    clash: singbox::ClashApi,
     wake: Notify,
 }
 
@@ -307,7 +336,8 @@ impl App {
     }
 
     /// Rebuild + apply the sing-box config from the current pool.
-    async fn apply_config(&self) -> Result<()> {
+    /// Returns what the sidecar did: "hot" or "restart".
+    async fn apply_config(&self) -> Result<&'static str> {
         let cfg = self.cfg.read().await.clone();
         let nodes = self.inner.read().await.nodes.clone();
         let mut sc = self.sidecar.lock().await;
@@ -326,15 +356,17 @@ impl App {
             &busy,
             &cfg.exit_listen,
             cfg.disable_udp,
+            Some(&self.clash),
         );
         sc.apply(
             &cfg.sing_box,
             &self.singbox_conf(&cfg.data_dir),
             &conf,
             &self.singbox_log(&cfg.data_dir),
+            Some(&self.clash),
         )
         .await?;
-        Ok(())
+        Ok(sc.last_action)
     }
 
     async fn fetch_all(&self, cfg: &Config) -> Result<(Vec<subs::Node>, Vec<SubStat>)> {
@@ -531,6 +563,7 @@ impl App {
                 &busy,
                 &cfg.exit_listen,
                 cfg.disable_udp,
+                Some(&self.clash),
             );
             if let Err(e) = sc
                 .apply(
@@ -538,6 +571,7 @@ impl App {
                     &self.singbox_conf(&cfg.data_dir),
                     &conf,
                     &self.singbox_log(&cfg.data_dir),
+                    Some(&self.clash),
                 )
                 .await
             {
@@ -1452,9 +1486,13 @@ async fn api_patch_config(
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
     }
     let mut restarted = false;
+    let mut hot = false;
     if needs_singbox {
         match app.apply_config().await {
-            Ok(_) => restarted = true,
+            Ok(action) => {
+                restarted = true;
+                hot = action == "hot";
+            }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1466,6 +1504,8 @@ async fn api_patch_config(
     }
     let note = if ports_moved {
         "端口段变了:所有客户端需要换成新端口"
+    } else if hot {
+        "已热切换:现有连接不断,新连接走新出口"
     } else if restarted {
         "已重载 sing-box(现有连接会断一下)"
     } else {
@@ -1556,6 +1596,10 @@ async fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&cfg.data_dir).ok();
     let (pool, last_sub_fetch) = App::load_pool(&cfg.data_dir);
+    let clash = singbox::ClashApi {
+        controller: format!("127.0.0.1:{}", cfg.clash_api_port),
+        secret: random_secret(),
+    };
 
     let listen = cfg.listen.clone();
     let refresh = cfg.refresh_minutes.max(1);
@@ -1577,6 +1621,7 @@ async fn main() -> Result<()> {
             limiter: api::Limiter::default(),
         }),
         sidecar: Mutex::new(singbox::Sidecar::default()),
+        clash,
         wake: Notify::new(),
     });
 

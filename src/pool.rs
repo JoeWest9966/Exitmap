@@ -655,7 +655,7 @@ impl Pool {
                 .filter(|(_, e)| e.country == cc && !e.pinned)
                 .map(|(i, _)| i)
                 .collect();
-            if self.resort(slots, members, blocks, port_base, now) {
+            if self.resort(slots, members, port_base, now) {
                 moved = true;
             }
         }
@@ -673,7 +673,7 @@ impl Pool {
             .filter(|(_, e)| block_cc(blocks, e.slot).is_none() && !e.pinned)
             .map(|(i, _)| i)
             .collect();
-        if self.resort(general, members, blocks, port_base, now) {
+        if self.resort(general, members, port_base, now) {
             moved = true;
         }
 
@@ -693,7 +693,6 @@ impl Pool {
         &mut self,
         mut slots: Vec<usize>,
         members: Vec<usize>,
-        blocks: &[CountryBlock],
         port_base: u16,
         now: i64,
     ) -> bool {
