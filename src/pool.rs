@@ -692,11 +692,24 @@ impl Pool {
             by_pos.extend(side);
         }
 
-        let clearly_inverted = by_pos.windows(2).any(|w| {
-            let (ahead, behind) = (key(&self.exits[w[0]]), key(&self.exits[w[1]]));
-            behind < ahead * (100 - SORT_MIN_GAIN_PCT) / 100
-                && ahead.saturating_sub(behind) >= SORT_MIN_GAIN_MS
-        });
+        // Every pair, not just neighbours. Three ports at 1000/800/640 are
+        // 20% apart step by step — an adjacent-only check calls that fine while
+        // the first port is 36% slower than the third. The whole point is
+        // "lowest port = lowest latency", so compare every position to every
+        // later one. n is tiny (one country's ports).
+        let mut clearly_inverted = false;
+        'pairs: for i in 0..by_pos.len() {
+            for j in (i + 1)..by_pos.len() {
+                let ahead = key(&self.exits[by_pos[i]]);
+                let behind = key(&self.exits[by_pos[j]]);
+                if behind < ahead * (100 - SORT_MIN_GAIN_PCT) / 100
+                    && ahead.saturating_sub(behind) >= SORT_MIN_GAIN_MS
+                {
+                    clearly_inverted = true;
+                    break 'pairs;
+                }
+            }
+        }
         if !clearly_inverted {
             return false;
         }
@@ -1131,6 +1144,45 @@ mod tests {
             p.exits.iter().find(|e| e.country == "JP").unwrap().port,
             31003,
             "an unrelated country never gets promoted into a US port"
+        );
+    }
+
+    #[test]
+    fn a_far_apart_inversion_is_caught_too() {
+        let base = 31001u16;
+        let max = 8usize;
+        let b = blocks("US=31001-31003", base, max);
+        let mut p = Pool::default();
+        p.reconcile(
+            &[live("1.1.1.1", "US", 300), live("2.2.2.2", "US", 250), live("3.3.3.3", "US", 200)],
+            base,
+            max,
+            &b,
+            1,
+        );
+        // Force a spread-out inversion: 31001=1000, 31002=800, 31003=640. Each
+        // adjacent step is 20%, so an adjacent-only check would call this fine,
+        // while 31001 is 36% slower than 31003.
+        for e in p.exits.iter_mut() {
+            e.lat_ema = match e.ip.as_str() {
+                "3.3.3.3" => 1000,
+                "2.2.2.2" => 800,
+                _ => 640,
+            };
+            e.latency_ms = e.lat_ema;
+        }
+        // Feed the same values back so the EMA update is an identity.
+        p.reconcile(
+            &[live("3.3.3.3", "US", 1000), live("2.2.2.2", "US", 800), live("1.1.1.1", "US", 640)],
+            base,
+            max,
+            &b,
+            2,
+        );
+        assert_eq!(
+            ports(&p),
+            vec![(31001, "1.1.1.1".into()), (31002, "2.2.2.2".into()), (31003, "3.3.3.3".into())],
+            "a 36% inversion two positions apart must be re-ranked"
         );
     }
 
