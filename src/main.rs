@@ -183,6 +183,9 @@ struct Status {
     last_sub_fetch_ms: i64,
     last_error: String,
     singbox_alive: bool,
+    /// A round is in flight. The panel uses it to refuse a second click instead
+    /// of silently queueing a whole extra minute of probing.
+    running: bool,
 }
 
 #[derive(Default)]
@@ -466,6 +469,7 @@ impl App {
 
     async fn cycle(self: &Arc<Self>) {
         let started = Instant::now();
+        self.inner.write().await.status.running = true;
         let cfg = self.cfg.read().await.clone();
         let now = now_ms();
 
@@ -506,6 +510,7 @@ impl App {
         let nodes = self.inner.read().await.nodes.clone();
         if nodes.is_empty() {
             self.inner.write().await.status.last_error = "还没有节点:先在面板里加一条订阅".into();
+            self.inner.write().await.status.running = false;
             return;
         }
 
@@ -716,6 +721,7 @@ impl App {
             pool.exits.iter().filter(|e| e.alive).count(),
             started.elapsed().as_millis()
         );
+        self.inner.write().await.status.running = false;
     }
 }
 
@@ -1136,8 +1142,23 @@ async fn api_pin(State(app): State<Arc<App>>, Path(slot): Path<usize>, Json(body
 }
 
 async fn api_refresh(State(app): State<Arc<App>>) -> Response {
+    // Refuse while a round is in flight. The wake permit is sticky, so a click
+    // during a round costs a whole extra minute of probing for nothing — that
+    // is the double-round people hit by clicking twice at an empty table.
+    if app.inner.read().await.status.running {
+        return (
+            StatusCode::CONFLICT,
+            "一轮正在跑（约 1 分钟），跑完再点",
+        )
+            .into_response();
+    }
+    // Clearing the stamp is what forces the refetch: `cycle` only calls
+    // `fetch_all` when this is zero or 30 minutes old. The old node list is
+    // kept until the new fetch actually succeeds, so a dead airport does not
+    // empty the table.
+    app.inner.write().await.status.last_sub_fetch_ms = 0;
     app.wake.notify_one();
-    (StatusCode::OK, "queued").into_response()
+    Json(json!({"ok": true, "note": "已排队：重拉订阅 + 重探一轮，约 1 分钟"})).into_response()
 }
 
 #[derive(Deserialize, Default)]

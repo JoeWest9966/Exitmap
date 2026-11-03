@@ -287,7 +287,7 @@ pre.snip{background:#0b0d11;border:1px solid var(--line);border-radius:9px;paddi
   <div class="brand"><b>Exitmap</b><span>一个出口 IP = 一个固定端口</span></div>
   <span class="grow"></span>
   <div class="chips" id="chips"></div>
-  <button id="refresh">立即刷新</button>
+  <button id="refresh" title="强制重拉订阅，然后重探一轮（约 1 分钟）">重拉订阅</button>
 </header>
 
 <main>
@@ -833,9 +833,11 @@ async function load(){
 
 $("#refresh").onclick = async () => {
   const b = $("#refresh"); b.disabled = true; b.textContent = "已排队…";
-  try{ await api("/api/refresh", {method:"POST"}); toast("已触发刷新，一轮约 1 分钟"); }
-  catch(e){ toast(e.message); }
-  setTimeout(() => { b.disabled = false; b.textContent = "立即刷新"; load(); }, 1200);
+  try{
+    const r = await api("/api/refresh", {method:"POST"});
+    toast((r && r.note) || "已排队，约 1 分钟");
+  }catch(e){ toast(String(e.message || e)); }
+  setTimeout(() => { b.disabled = false; b.textContent = "重拉订阅"; load(); }, 1200);
 };
 
 const SUB_TIP = "URL 即凭据：只写不显，存进 /etc/exitmap/config.json。";
