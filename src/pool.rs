@@ -525,7 +525,7 @@ impl Pool {
         // lands on whatever slot is free. Re-rank, but only when the existing
         // order is *clearly* wrong, and at most once an hour — every re-rank
         // restarts sing-box and drops every connection.
-        if self.sort_country_groups(blocks, port_base, now) {
+        if self.sort_country_groups(blocks, max_exits, port_base, now) {
             changed = true;
         }
 
@@ -618,85 +618,104 @@ impl Pool {
         !self.exits.iter().any(|e| e.slot == slot)
     }
 
-    /// Re-rank every country group whose port order is clearly wrong.
-    /// Returns true when anything moved.
-    fn sort_country_groups(&mut self, blocks: &[CountryBlock], port_base: u16, now: i64) -> bool {
+    /// Re-rank every group whose port order is clearly wrong: each country's
+    /// reserved ports first, then the general pool (everything nobody reserved)
+    /// as one more group. Returns true when anything moved.
+    fn sort_country_groups(
+        &mut self,
+        blocks: &[CountryBlock],
+        max_exits: usize,
+        port_base: u16,
+        now: i64,
+    ) -> bool {
         // `last_sort_ms == 0` means "never sorted" — a fresh pool must be
         // allowed to find its order immediately, the cooldown only applies to
         // the second re-rank onwards.
-        if blocks.is_empty()
-            || (self.last_sort_ms > 0 && now - self.last_sort_ms < SORT_COOLDOWN_MS)
-        {
+        if self.last_sort_ms > 0 && now - self.last_sort_ms < SORT_COOLDOWN_MS {
             return false;
         }
+        let mut moved = false;
+
+        // 1. every country that reserved ports
         let mut ccs: Vec<String> = blocks.iter().map(|b| b.cc.clone()).collect();
         ccs.sort();
         ccs.dedup();
-        let mut moved = false;
         for cc in ccs {
-            if self.sort_one_group(&cc, blocks, port_base, now) {
+            let mut slots: Vec<usize> = blocks
+                .iter()
+                .filter(|b| b.cc == cc)
+                .flat_map(|b| b.from_slot..=b.to_slot)
+                .collect();
+            slots.sort_unstable();
+            slots.dedup();
+            let members: Vec<usize> = self
+                .exits
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.country == cc && !e.pinned)
+                .map(|(i, _)| i)
+                .collect();
+            if self.resort(slots, members, blocks, port_base, now) {
                 moved = true;
             }
         }
+
+        // 2. the general pool is one group too: the lowest unreserved port gets
+        // the fastest exit that has no country block. This is what makes 31005
+        // mean something when 31001-31004 are pinned.
+        let general: Vec<usize> = (0..max_exits)
+            .filter(|s| block_cc(blocks, *s).is_none())
+            .collect();
+        let members: Vec<usize> = self
+            .exits
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| block_cc(blocks, e.slot).is_none() && !e.pinned)
+            .map(|(i, _)| i)
+            .collect();
+        if self.resort(general, members, blocks, port_base, now) {
+            moved = true;
+        }
+
         if moved {
             self.last_sort_ms = now;
         }
         moved
     }
 
-    /// One country: put its fastest exit on its lowest port.
+    /// Put the fastest member on the lowest slot of `slots`.
     ///
     /// IP-pinned exits are excluded and their slots are not sortable — a pin
     /// means "this exact IP on this port", so latency does not get a vote.
-    fn sort_one_group(
+    /// Members may sit outside `slots` (a country with more exits than reserved
+    /// ports); whoever gets displaced inherits the slot of whoever displaced it.
+    fn resort(
         &mut self,
-        cc: &str,
+        mut slots: Vec<usize>,
+        members: Vec<usize>,
         blocks: &[CountryBlock],
         port_base: u16,
         now: i64,
     ) -> bool {
-        let mut slots: Vec<usize> = blocks
-            .iter()
-            .filter(|b| b.cc == cc)
-            .flat_map(|b| b.from_slot..=b.to_slot)
-            .collect();
-        slots.sort_unstable();
-        slots.dedup();
         slots.retain(|s| !self.exits.iter().any(|e| e.slot == *s && e.pinned));
-        if slots.is_empty() {
-            return false;
-        }
-
-        let members: Vec<usize> = self
-            .exits
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.country == cc && !e.pinned)
-            .map(|(i, _)| i)
-            .collect();
-        if members.len() < 2 {
+        if slots.is_empty() || members.len() < 2 {
             return false;
         }
 
         let key = |e: &ExitView| if e.lat_ema > 0 { e.lat_ema } else { e.latency_ms };
-        // Position order = block ports ascending, then everything outside the
-        // block. "Behind" means "sitting on a worse port".
-        let mut by_pos: Vec<usize> = Vec::with_capacity(members.len());
-        for pass in [true, false] {
-            let mut side: Vec<usize> = members
-                .iter()
-                .copied()
-                .filter(|i| (block_cc(blocks, self.exits[*i].slot) == Some(cc)) == pass)
-                .collect();
-            side.sort_by_key(|i| self.exits[*i].slot);
-            by_pos.extend(side);
-        }
+        // Position order = target slots ascending, then members that live
+        // outside them. "Behind" means "sitting on a worse port".
+        let mut by_pos = members.clone();
+        by_pos.sort_by_key(|i| {
+            let s = self.exits[*i].slot;
+            (!slots.contains(&s), s)
+        });
 
         // Every pair, not just neighbours. Three ports at 1000/800/640 are
         // 20% apart step by step — an adjacent-only check calls that fine while
         // the first port is 36% slower than the third. The whole point is
         // "lowest port = lowest latency", so compare every position to every
-        // later one. n is tiny (one country's ports).
+        // later one. n is tiny per group.
         let mut clearly_inverted = false;
         'pairs: for i in 0..by_pos.len() {
             for j in (i + 1)..by_pos.len() {
@@ -719,22 +738,22 @@ impl Pool {
         by_lat.sort_by_key(|i| key(&self.exits[*i]));
         let top: Vec<usize> = by_lat[..k].to_vec();
 
-        let in_block: Vec<usize> = by_pos
+        let in_slots: Vec<usize> = by_pos
             .iter()
             .copied()
-            .filter(|i| block_cc(blocks, self.exits[*i].slot) == Some(cc))
+            .filter(|i| slots.contains(&self.exits[*i].slot))
             .collect();
-        let wanted_outside: Vec<usize> = top.iter().copied().filter(|i| !in_block.contains(i)).collect();
-        let unwanted_in_block: Vec<usize> = in_block.iter().copied().filter(|i| !top.contains(i)).collect();
+        let wanted_outside: Vec<usize> = top.iter().copied().filter(|i| !in_slots.contains(i)).collect();
+        let unwanted_in_slots: Vec<usize> = in_slots.iter().copied().filter(|i| !top.contains(i)).collect();
 
         // Fastest takes the lowest port; a member pushed out of a full group
-        // inherits the slot of the one that displaced it (that slot is always a
-        // general one, so the swap is legal both ways).
+        // inherits the slot of the one that displaced it (that slot is outside
+        // the group, so the swap is legal both ways).
         let mut targets: Vec<(usize, usize)> = Vec::new();
         for (i, &m) in top.iter().enumerate() {
             targets.push((m, slots[i]));
         }
-        for (j, &m) in unwanted_in_block.iter().enumerate() {
+        for (j, &m) in unwanted_in_slots.iter().enumerate() {
             if let Some(&give) = wanted_outside.get(j) {
                 targets.push((m, self.exits[give].slot));
             }
@@ -1183,6 +1202,90 @@ mod tests {
             ports(&p),
             vec![(31001, "1.1.1.1".into()), (31002, "2.2.2.2".into()), (31003, "3.3.3.3".into())],
             "a 36% inversion two positions apart must be re-ranked"
+        );
+    }
+
+    #[test]
+    fn the_general_pool_is_ranked_too() {
+        let base = 31001u16;
+        let max = 8usize;
+        let mut p = Pool::default();
+        p.reconcile(
+            &[live("1.1.1.1", "JP", 100), live("2.2.2.2", "KR", 200), live("3.3.3.3", "DE", 300)],
+            base,
+            max,
+            &[],
+            1,
+        );
+        assert_eq!(
+            ports(&p),
+            vec![(31001, "1.1.1.1".into()), (31002, "2.2.2.2".into()), (31003, "3.3.3.3".into())]
+        );
+        // Invert hard: EMA becomes 340 / 395 / 240.
+        p.reconcile(
+            &[live("1.1.1.1", "JP", 900), live("2.2.2.2", "KR", 850), live("3.3.3.3", "DE", 100)],
+            base,
+            max,
+            &[],
+            2,
+        );
+        assert_eq!(
+            ports(&p),
+            vec![(31001, "3.3.3.3".into()), (31002, "1.1.1.1".into()), (31003, "2.2.2.2".into())],
+            "with no country blocks the whole table is one group"
+        );
+    }
+
+    #[test]
+    fn the_lowest_unreserved_port_gets_the_fastest_unreserved_exit() {
+        let base = 31001u16;
+        let max = 8usize;
+        let b = blocks("US=31001-31002", base, max);
+        let mut p = Pool::default();
+        p.reconcile(
+            &[
+                live("1.1.1.1", "US", 400),
+                live("2.2.2.2", "US", 600),
+                live("3.3.3.3", "JP", 200),
+                live("4.4.4.4", "KR", 100),
+            ],
+            base,
+            max,
+            &b,
+            1,
+        );
+        // 31003 = KR (100ms), 31004 = JP (200ms)
+        assert_eq!(
+            ports(&p),
+            vec![
+                (31001, "1.1.1.1".into()),
+                (31002, "2.2.2.2".into()),
+                (31003, "4.4.4.4".into()),
+                (31004, "3.3.3.3".into()),
+            ]
+        );
+        // KR slows down and JP speeds up: EMA 340 vs 185 -> 31003 must flip.
+        p.reconcile(
+            &[
+                live("1.1.1.1", "US", 400),
+                live("2.2.2.2", "US", 600),
+                live("3.3.3.3", "JP", 150),
+                live("4.4.4.4", "KR", 900),
+            ],
+            base,
+            max,
+            &b,
+            2,
+        );
+        assert_eq!(
+            ports(&p),
+            vec![
+                (31001, "1.1.1.1".into()),
+                (31002, "2.2.2.2".into()),
+                (31003, "3.3.3.3".into()),
+                (31004, "4.4.4.4".into()),
+            ],
+            "31003 is the lowest unreserved port, so it takes the fastest unreserved exit"
         );
     }
 
