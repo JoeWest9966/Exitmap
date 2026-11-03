@@ -457,6 +457,31 @@ impl Pool {
             changed = true;
         }
 
+        // ── ③ Reserved ports outlive the IP that held them ────────────────
+        // ①/② never move a live, legal exit, so a reserved port whose IP died
+        // would sit closed while a matching exit idles one slot over. The
+        // promise is "this port keeps serving that country", not "that IP":
+        // pull a same-country exit in instead of leaving the port dark.
+        let mut reserved: Vec<usize> = blocks
+            .iter()
+            .flat_map(|b| b.from_slot..=b.to_slot)
+            .filter(|s| *s < max_exits)
+            .collect();
+        reserved.sort_unstable();
+        reserved.dedup();
+        for slot in reserved {
+            if self.exits.iter().any(|e| e.slot == slot) {
+                continue;
+            }
+            let cc = block_cc(blocks, slot).unwrap_or("").to_string();
+            if cc.is_empty() {
+                continue;
+            }
+            if self.fill_slot(slot, &cc, blocks, port_base, now).is_some() {
+                changed = true;
+            }
+        }
+
         self.exits.sort_by_key(|e| e.slot);
         for e in self.exits.iter_mut() {
             e.port = Self::slot_port(port_base, e.slot);
@@ -732,6 +757,38 @@ mod tests {
     }
 
     #[test]
+    fn a_reserved_port_is_refilled_after_its_ip_dies() {
+        let base = 31001u16;
+        let max = 8usize;
+        let b = blocks("JP=31001", base, max); // one reserved JP port
+        let mut p = Pool::default();
+        // Round 1: A takes the reserved port, B lands on a general one.
+        p.reconcile(&[live("1.1.1.1", "JP", 10), live("2.2.2.2", "JP", 20)], base, max, &b, 1);
+        assert_eq!(ports(&p), vec![(31001, "1.1.1.1".into()), (31002, "2.2.2.2".into())]);
+
+        // Round 2: A died. B is still alive and legal where it sits, so ①/②
+        // leave it alone — ③ is what keeps 31001 serving JP instead of going
+        // dark while a JP exit idles on 31002.
+        let out = p.reconcile(&[live("2.2.2.2", "JP", 20)], base, max, &b, 2);
+        assert!(out.changed);
+        assert_eq!(ports(&p), vec![(31001, "2.2.2.2".into())]);
+        assert!(p.log.iter().any(|r| r.reason.contains("国家端口固定")));
+    }
+
+    #[test]
+    fn a_reserved_port_stays_closed_when_no_matching_country_exists() {
+        let base = 31001u16;
+        let max = 8usize;
+        let b = blocks("JP=31001", base, max);
+        let mut p = Pool::default();
+        p.reconcile(&[live("1.1.1.1", "US", 10)], base, max, &b, 1);
+        // US may not take the JP port and there is no JP exit to pull in: the
+        // reserved port stays empty rather than serving the wrong country.
+        assert_eq!(ports(&p), vec![(31002, "1.1.1.1".into())]);
+        assert!(!p.exits.iter().any(|e| e.slot == 0));
+    }
+
+    #[test]
     fn pinning_a_port_evicts_the_wrong_country_occupant() {
         let base = 31001u16;
         let max = 8usize;
@@ -756,8 +813,10 @@ mod tests {
         let out = p.reconcile(&[live("1.1.1.1", "US", 10), live("2.2.2.2", "JP", 20)], base, max, &b, 2);
         assert!(out.changed);
         // JP keeps a reserved slot; US is pushed to the first general slot.
-        // JP stays on 31002 instead of being shuffled to 31001: an exit that is
-        // already legal does not churn just because the block starts lower.
+        // JP stays on 31002: ③ only pulls exits out of *general* slots, it does
+        // not shuffle a country between two of its own reserved ports (that
+        // would cost a client a port and buy nothing). 31001 self-heals when
+        // the next JP IP shows up, because reserved slots are tried first.
         assert_eq!(ports(&p), vec![(31002, "2.2.2.2".into()), (31003, "1.1.1.1".into())]);
         // The move is logged, not silent.
         assert!(p.log.iter().any(|r| r.reason.contains("国家端口段")));
