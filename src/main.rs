@@ -1012,7 +1012,7 @@ async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
         // so there is exactly one source of truth and no state migration.
         let blocks = pool::parse_country_slots(&cfg.country_slots, cfg.port_base, cfg.max_exits)
             .unwrap_or_default();
-        inner
+        let mut rows: Vec<Value> = inner
             .pool
             .exits
             .iter()
@@ -1023,10 +1023,38 @@ async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
                         "slotCountry".into(),
                         json!(pool::block_cc(&blocks, e.slot).unwrap_or("")),
                     );
+                    o.insert("placeholder".into(), json!(false));
                 }
                 v
             })
-            .collect()
+            .collect();
+        // Reserved ports with nothing on them still belong in the table: a pin
+        // that visibly vanished for two rounds reads as a bug, and "31001 是
+        // US" is a contract about the port, not about whatever IP happens to
+        // be alive right now.
+        for (port, slot, cc, rebinds) in
+            inner.pool.reserved_placeholders(&blocks, cfg.port_base, cfg.max_exits)
+        {
+            rows.push(json!({
+                "slot": slot,
+                "port": port,
+                "ip": "",
+                "country": "",
+                "latencyMs": 0,
+                "nodeId": "",
+                "nodeName": format!("等待 {cc} 出口"),
+                "proto": "",
+                "sinceMs": 0,
+                "verifiedMs": 0,
+                "rebinds": rebinds,
+                "pinned": false,
+                "alive": false,
+                "slotCountry": cc,
+                "placeholder": true,
+            }));
+        }
+        rows.sort_by_key(|v| v.get("port").and_then(|p| p.as_u64()).unwrap_or(0));
+        rows
     };
     let log: Vec<&Rebind> = inner.pool.log.iter().take(60).collect();
     Json(json!({
@@ -1139,6 +1167,11 @@ async fn api_pin_country(
     // we have already moved rows around in memory.
     {
         let mut c = app.cfg.write().await;
+        eprintln!(
+            "[exitmap] 端口 {port} 国家固定: {} -> {}",
+            if c.country_slots.trim().is_empty() { "（无）" } else { c.country_slots.trim() },
+            if slots.trim().is_empty() { "（无）" } else { slots.trim() },
+        );
         c.country_slots = slots.clone();
         if let Err(e) = save_config(&c) {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
@@ -1379,6 +1412,11 @@ async fn api_patch_config(
         app.inner.write().await.pool.rebase(c.port_base);
     }
     if slots_changed {
+        eprintln!(
+            "[exitmap] 国家端口段: {} -> {}",
+            if old.country_slots.trim().is_empty() { "（无）" } else { old.country_slots.trim() },
+            if c.country_slots.trim().is_empty() { "（无）" } else { c.country_slots.trim() },
+        );
         // Free every exit that the new blocks make illegal, then wake the
         // worker so it re-places those IPs now instead of in five minutes.
         let blocks = pool::parse_country_slots(&c.country_slots, c.port_base, c.max_exits)

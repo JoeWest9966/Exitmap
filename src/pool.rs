@@ -457,6 +457,13 @@ impl Pool {
             changed = true;
         }
 
+        // Flush ①/② before ③: `note` inserts at the front, so writing the
+        // release/placement batch first and the fill on top keeps the log in
+        // the order things actually happened (newest first, reading down).
+        for ev in events {
+            self.note(ev);
+        }
+
         // ── ③ Reserved ports outlive the IP that held them ────────────────
         // ①/② never move a live, legal exit, so a reserved port whose IP died
         // would sit closed while a matching exit idles one slot over. The
@@ -486,10 +493,39 @@ impl Pool {
         for e in self.exits.iter_mut() {
             e.port = Self::slot_port(port_base, e.slot);
         }
-        for ev in events {
-            self.note(ev);
-        }
         ReconcileOutcome { changed, dropped }
+    }
+
+    /// Reserved ports with nothing on them, so the panel can keep showing the
+    /// row instead of letting a pinned port vanish for a few minutes.
+    ///
+    /// "31001 是 US" is a contract, not a row that comes and goes: an empty
+    /// reserved port is still a fact about the table, and hiding it is what
+    /// makes people think the pin broke.
+    pub fn reserved_placeholders(
+        &self,
+        blocks: &[CountryBlock],
+        port_base: u16,
+        max_exits: usize,
+    ) -> Vec<(u16, usize, String, u32)> {
+        let mut out: Vec<(u16, usize, String, u32)> = blocks
+            .iter()
+            .flat_map(|b| {
+                (b.from_slot..=b.to_slot).map(move |s| (s, b.cc.clone()))
+            })
+            .filter(|(s, _)| *s < max_exits)
+            .filter(|(s, _)| !self.exits.iter().any(|e| e.slot == *s))
+            .map(|(s, cc)| {
+                (
+                    Self::slot_port(port_base, s),
+                    s,
+                    cc,
+                    self.slot_rebinds.get(&s).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        out.sort_by_key(|(port, _, _, _)| *port);
+        out
     }
 
     /// Drop every exit whose slot is illegal under `blocks`, so the caller can
@@ -548,6 +584,8 @@ impl Pool {
             return false;
         }
         let ip = self.exits[idx].ip.clone();
+        let old_slot = self.exits[idx].slot;
+        let old_port = self.exits[idx].port;
         let prev = self.slot_last.get(&new_slot).cloned();
         let n = self.slot_rebinds.get(&new_slot).copied().unwrap_or(0) + 1;
         self.slot_rebinds.insert(new_slot, n);
@@ -558,6 +596,17 @@ impl Pool {
         e.since_ms = now;
         e.rebinds = n;
         let (slot, port) = (e.slot, e.port);
+        // Log the vacated port too. Without it a port can go empty with nothing
+        // in the log explaining where its exit went — which is exactly the
+        // "31001 消失了" report this had to be debugged from.
+        self.note(Rebind {
+            at_ms: now,
+            slot: old_slot,
+            port: old_port,
+            from_ip: Some(ip.clone()),
+            to_ip: None,
+            reason: format!("{reason}（原端口让出，出口搬到 {port}）"),
+        });
         self.note(Rebind {
             at_ms: now,
             slot,
@@ -773,6 +822,13 @@ mod tests {
         assert!(out.changed);
         assert_eq!(ports(&p), vec![(31001, "2.2.2.2".into())]);
         assert!(p.log.iter().any(|r| r.reason.contains("国家端口固定")));
+        // Both ends of the move are on the record: 31002 gave the exit up and
+        // 31001 received it, so a port never goes empty unaccounted for.
+        assert!(p
+            .log
+            .iter()
+            .any(|r| r.port == 31002 && r.to_ip.is_none() && r.reason.contains("原端口让出")));
+        assert!(p.log.iter().any(|r| r.port == 31001 && r.to_ip.as_deref() == Some("2.2.2.2")));
     }
 
     #[test]
@@ -786,6 +842,24 @@ mod tests {
         // reserved port stays empty rather than serving the wrong country.
         assert_eq!(ports(&p), vec![(31002, "1.1.1.1".into())]);
         assert!(!p.exits.iter().any(|e| e.slot == 0));
+    }
+
+    #[test]
+    fn empty_reserved_ports_are_still_reported() {
+        let base = 31001u16;
+        let max = 8usize;
+        let b = blocks("JP=31001-31003", base, max);
+        let mut p = Pool::default();
+        p.reconcile(&[live("1.1.1.1", "JP", 10)], base, max, &b, 1);
+        // 31001 is taken; 31002/31003 are reserved but empty and must still be
+        // listed, so a pinned port cannot silently disappear from the table.
+        let holes = p.reserved_placeholders(&b, base, max);
+        assert_eq!(
+            holes,
+            vec![(31002, 1, "JP".to_string(), 0), (31003, 2, "JP".to_string(), 0)]
+        );
+        // Nothing is invented for ports nobody reserved.
+        assert!(holes.iter().all(|(port, _, _, _)| *port >= 31002));
     }
 
     #[test]

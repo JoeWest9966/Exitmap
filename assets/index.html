@@ -67,6 +67,8 @@ th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line-soft);
 th{color:var(--mute);font-weight:500;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;background:var(--panel2)}
 tbody tr:last-child td{border-bottom:none}
 tbody tr:hover{background:rgba(255,255,255,.02)}
+tbody tr.ph{opacity:.55}
+tbody tr.ph:hover{opacity:.8}
 .port{font-family:var(--mono);font-weight:600;color:var(--accent)}
 .ip{font-family:var(--mono)}
 .mono{font-family:var(--mono)}
@@ -678,20 +680,31 @@ function renderExits(exits){
   LAST_EXITS = exits || [];
   const tb = $("#exits");
   if(!exits.length){ tb.innerHTML = `<tr><td colspan="8" class="empty">还没有出口 —— 等第一轮探测完成，或先加一条订阅。</td></tr>`; return; }
-  tb.innerHTML = exits.map(e => `
-    <tr>
-      <td><span class="port">${e.port}</span></td>
-      <td class="ip">${esc(e.ip)}</td>
-      <td>${esc(e.country || "—")}${e.slotCountry ? ` <span class="badge pin" title="这个端口只接 ${esc(e.slotCountry)} 的出口">🔒 ${esc(e.slotCountry)}</span>` : ""}</td>
-      <td class="mono ${e.latencyMs > 1500 ? "dim" : ""}">${e.latencyMs}ms</td>
-      <td><span class="nm dim" title="${esc(e.nodeName)}">${esc(e.nodeName || "")}</span></td>
-      <td>${e.alive ? '<span class="badge on"><i class="dot"></i>在轮询</span>'
-                    : '<span class="badge off"><i class="dot"></i>端口关闭</span>'}${e.pinned ? ' <span class="badge pin">钉住</span>' : ''}</td>
-      <td class="dim mono">${e.rebinds ? e.rebinds + " 次" : "—"}<br>${e.alive ? `<span title="该 IP 从什么时候开始占这个端口">${ago(e.sinceMs)}</span>` : ""}</td>
-      <td><button class="tiny" data-copy="${e.port}">复制</button>
+  tb.innerHTML = exits.map(e => {
+    // 占位行 = 这个端口被固定给了某国，但眼下没有该国的出口。端口真的关着，
+    // 但行不能消失：端口号是契约，不是有货才显示的缓存。
+    const ph = !!e.placeholder;
+    const lock = e.slotCountry
+      ? ` <span class="badge pin" title="这个端口只接 ${esc(e.slotCountry)} 的出口">🔒 ${esc(e.slotCountry)}</span>` : "";
+    const status = e.alive
+      ? '<span class="badge on"><i class="dot"></i>在轮询</span>'
+      : '<span class="badge off"><i class="dot"></i>端口关闭</span>';
+    const actions = ph
+      ? `<button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button>`
+      : `<button class="tiny" data-copy="${e.port}">复制</button>
           <button class="tiny" data-pin="${e.slot}" data-to="${e.pinned ? "false" : "true"}">${e.pinned ? "解锁" : "钉住"}</button>
-          <button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button></td>
-    </tr>`).join("");
+          <button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button>`;
+    return `<tr class="${ph ? "ph" : ""}">
+      <td><span class="port">${e.port}</span></td>
+      <td class="ip">${ph ? "—" : esc(e.ip)}</td>
+      <td>${ph ? "—" : esc(e.country || "—")}${lock}</td>
+      <td class="mono ${!ph && e.latencyMs > 1500 ? "dim" : ""}">${ph ? "—" : e.latencyMs + "ms"}</td>
+      <td><span class="nm dim" title="${esc(e.nodeName)}">${esc(e.nodeName || "")}</span></td>
+      <td>${status}${e.pinned ? ' <span class="badge pin">钉住</span>' : ''}</td>
+      <td class="dim mono">${e.rebinds ? e.rebinds + " 次" : "—"}<br>${!ph && e.alive ? `<span title="该 IP 从什么时候开始占这个端口">${ago(e.sinceMs)}</span>` : ""}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join("");
   tb.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
     const addr = "127.0.0.1:" + b.dataset.copy;
     const ok = await copyText(addr);
