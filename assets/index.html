@@ -72,6 +72,7 @@ table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line-soft);font-size:13px;white-space:nowrap}
 th{color:var(--mute);font-weight:500;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;background:var(--panel2)}
 tbody tr:last-child td{border-bottom:none}
+tbody tr{cursor:context-menu}
 tbody tr:hover{background:rgba(255,255,255,.02)}
 tbody tr.ph{opacity:.55}
 tbody tr.ph:hover{opacity:.8}
@@ -148,6 +149,12 @@ ul.log .arrow{color:var(--mute)}
 .ctx .i.danger{color:var(--bad)}
 .ctx .i.danger:hover{background:var(--bad-soft)}
 .ctx .i .k{color:var(--mute);font-size:11px}
+.ctx .i .k.ping-ok{color:var(--ok)}
+.ctx .i .k.ping-warn{color:var(--warn)}
+.ctx .i .k.ping-bad{color:var(--bad)}
+.ctx .i .k.ping-wait{color:var(--mute)}
+/* 手机没右键，··· 是同一个菜单的另一扇门 */
+button.tiny.more{min-width:30px;padding:5px 7px;font-weight:700;letter-spacing:1px}
 .ctx .sep{height:1px;background:var(--line);margin:4px 3px}
 
 /* 编辑订阅的表单行（不能用 .cc-row，那个会把内容全转大写） */
@@ -750,13 +757,12 @@ function renderExits(exits){
     const status = e.alive
       ? '<span class="badge on"><i class="dot"></i>在轮询</span>'
       : '<span class="badge off"><i class="dot"></i>端口关闭</span>';
-    const actions = ph
-      ? `<button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button>`
-      : `<button class="tiny ${pingCls(e.port)}" data-ping="${e.port}" title="点一下实测这个出口的延迟，不改排序">${pingText(e.port)}</button>
-          <button class="tiny" data-copy="${e.port}">复制</button>
-          <button class="tiny" data-pin="${e.slot}" data-to="${e.pinned ? "false" : "true"}">${e.pinned ? "解锁" : "钉住"}</button>
-          <button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button>`;
-    return `<tr class="${ph ? "ph" : ""}">
+    // 四个动作收进右键菜单，行里只留一扇门。ping 的结果不再有按钮可躲，
+    // 所以给 ··· 上色 + 写进菜单 hint，数字照样看得见。
+    const pc = ph ? "" : pingCls(e.port);
+    const phint = ph ? "" : pingTitle(e.port);
+    const actions = `<button class="tiny more ${pc}" data-menu="${e.slot}" title="${esc(phint || "点开操作菜单")}">···</button>`;
+    return `<tr class="${ph ? "ph" : ""}" data-exit="${e.slot}">
       <td><span class="port">${e.port}</span></td>
       <td class="ip">${ph ? "—" : esc(e.ip)}</td>
       <td>${ph ? "—" : esc(e.country || "—")}${lock}</td>
@@ -767,23 +773,50 @@ function renderExits(exits){
       <td>${actions}</td>
     </tr>`;
   }).join("");
-  tb.querySelectorAll("[data-ping]").forEach(b => b.onclick = () => pingExit(Number(b.dataset.ping)));
-  tb.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
-    const addr = "127.0.0.1:" + b.dataset.copy;
-    const ok = await copyText(addr);
-    if(ok){ b.textContent = "已复制"; setTimeout(() => b.textContent = "复制", 1200); }
-    toast(ok ? "已复制 " + addr : "复制失败，手动选：" + addr);
+  const bySlot = new Map(exits.map(e => [e.slot, e]));
+  tb.querySelectorAll("tr[data-exit]").forEach(row => {
+    const e = bySlot.get(Number(row.dataset.exit));
+    if(!e) return;
+    row.oncontextmenu = ev => openCtx(ev, exitMenu(e));
   });
-  tb.querySelectorAll("[data-pin]").forEach(b => b.onclick = async () => {
-    try{
-      await api(`/api/exits/${b.dataset.pin}/pin`, {method:"POST",headers:{"content-type":"application/json"},
-        body:JSON.stringify({pinned: b.dataset.to === "true"})});
-      toast(b.dataset.to === "true" ? "已钉住：该端口不会换 IP" : "已解锁");
-      load();
-    }catch(e){ toast("操作失败: " + e.message); }
+  tb.querySelectorAll("[data-menu]").forEach(b => b.onclick = ev => {
+    const e = bySlot.get(Number(b.dataset.menu));
+    if(!e) return;
+    ev.stopPropagation();
+    const r = b.getBoundingClientRect();
+    openCtx({preventDefault(){}, stopPropagation(){}, clientX: r.left, clientY: r.bottom + 4}, exitMenu(e));
   });
-  tb.querySelectorAll("[data-cc]").forEach(b => b.onclick = () =>
-    openCountryModal(Number(b.dataset.cc), b.dataset.cur, LAST_EXITS));
+}
+
+// ── 出口行的右键菜单 ───────────────────────────────────────────────────────
+// 占位行（端口被固定给某国、眼下没货）只有「固定国家」一项——它连出口都没有，
+// 测速/复制/钉住都是假的。菜单项捕获的是渲染那一刻的 e，slot 是稳定的数字，
+// 5 秒后整表重绘也不会让「钉住」钉到别的端口上。
+function exitMenu(e){
+  if(e.placeholder){
+    return [{label:"固定国家…", hint:e.slotCountry || "未指定",
+      onpick:() => openCountryModal(e.port, e.slotCountry || "", LAST_EXITS)}];
+  }
+  const p = pingHint(e.port);
+  return [
+    {label:"测速 ping", hint:p.text, hintCls:p.cls, onpick:() => pingExit(e.port)},
+    {label:"复制地址", hint:e.port, onpick:async () => {
+      const addr = "127.0.0.1:" + e.port;
+      const ok = await copyText(addr);
+      toast(ok ? "已复制 " + addr : "复制失败，手动选：" + addr);
+    }},
+    {label: e.pinned ? "解锁" : "钉住", hint: e.pinned ? "允许换 IP" : "不再换 IP",
+      onpick:async () => {
+        try{
+          await api(`/api/exits/${e.slot}/pin`, {method:"POST", headers:{"content-type":"application/json"},
+            body:JSON.stringify({pinned: !e.pinned})});
+          toast(e.pinned ? "已解锁" : "已钉住：该端口不会换 IP");
+          load();
+        }catch(err){ toast("操作失败: " + err.message); }
+      }},
+    {label:"固定国家…", hint:e.slotCountry || "未指定",
+      onpick:() => openCountryModal(e.port, e.slotCountry || "", LAST_EXITS)},
+  ];
 }
 
 // ── 手动测速 ───────────────────────────────────────────────────────────────
@@ -792,19 +825,29 @@ function renderExits(exits){
 let PING = {};
 const PING_TTL = 5 * 60 * 1000;
 
-function pingText(port){
-  const p = PING[port];
-  if(!p || (!p.pending && Date.now() - p.at > PING_TTL)) return "ping";
-  if(p.pending) return "…";
-  if(!p.ok) return "超时";
-  return p.ms + "ms";
-}
 function pingCls(port){
   const p = PING[port];
   if(!p || (!p.pending && Date.now() - p.at > PING_TTL)) return "";
   if(p.pending) return "ping-wait";
   if(!p.ok) return "ping-bad";
   return p.changed ? "ping-warn" : "ping-ok";
+}
+
+// 按钮没了，测速结果得另有去处：菜单项 hint + ··· 的颜色和 title。
+function pingHint(port){
+  const p = PING[port];
+  if(!p || (!p.pending && Date.now() - p.at > PING_TTL)) return {text:"手动测速", cls:""};
+  if(p.pending) return {text:"探测中…", cls:"ping-wait"};
+  if(!p.ok) return {text:"超时", cls:"ping-bad"};
+  return {text:`${p.ms}ms · ${ago(p.at)}`, cls:p.changed ? "ping-warn" : "ping-ok"};
+}
+function pingTitle(port){
+  const p = PING[port];
+  if(!p || (!p.pending && Date.now() - p.at > PING_TTL)) return "点开操作菜单（右键这一行也行）";
+  if(p.pending) return "正在测速… · 点开操作菜单";
+  return p.ok
+    ? `上次测速 ${p.ms}ms${p.changed ? "（出口 IP 已换绑）" : ""} · ${ago(p.at)} · 点开操作菜单`
+    : "上次测速超时 · 点开操作菜单";
 }
 
 async function pingExit(port){
@@ -925,7 +968,7 @@ function openCtx(ev, items){
   ev.stopPropagation();
   const c = $("#ctx");
   c.innerHTML = items.map((it, i) => it.sep ? `<div class="sep"></div>`
-    : `<button class="i ${it.danger ? "danger" : ""}" data-i="${i}">${esc(it.label)}${it.hint ? `<span class="k">${esc(it.hint)}</span>` : ""}</button>`).join("");
+    : `<button class="i ${it.danger ? "danger" : ""}" data-i="${i}">${esc(it.label)}${it.hint ? `<span class="k ${esc(it.hintCls || "")}">${esc(it.hint)}</span>` : ""}</button>`).join("");
   c.classList.add("on");
   // 贴边时往回翻，否则菜单会有一半在屏幕外。
   const r = c.getBoundingClientRect();
