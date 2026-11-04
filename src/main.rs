@@ -24,7 +24,7 @@ use pool::{ExitView, LiveIp, Pool, Rebind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -76,6 +76,10 @@ struct Sub {
     /// Comma-separated keywords; a node whose name contains one is dropped.
     /// Airlines pad feeds with "剩余流量" and "过期" rows that are never exits.
     exclude: String,
+    /// Hard cap on how many of this feed's nodes may enter a probe round.
+    /// 0 = unlimited. Without it one 228-node feed eats the whole global probe
+    /// budget and a second, smaller feed is left with nothing.
+    quota: usize,
 }
 
 impl Default for Sub {
@@ -87,6 +91,7 @@ impl Default for Sub {
             enabled: true,
             protos: Vec::new(),
             exclude: String::new(),
+            quota: 0,
         }
     }
 }
@@ -226,6 +231,9 @@ struct SubStat {
     filtered: usize,
     /// Protocol histogram of the surviving nodes, biggest first.
     proto_counts: Vec<(String, usize)>,
+    /// Candidates that survived the feed's own rules but never made it into the
+    /// probe list — dropped by the global cap or as a cross-feed duplicate.
+    unprobed: usize,
     /// How many live exits currently come from this feed. Filled in by the
     /// state handler, which is the only place that knows the pool.
     used: usize,
@@ -414,9 +422,13 @@ impl App {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(45))
             .build()?;
-        let mut nodes: Vec<subs::Node> = Vec::new();
         let mut errs: Vec<String> = Vec::new();
         let mut stats: Vec<SubStat> = Vec::new();
+        // One list per feed, in feed order. Keeping them separate is the point:
+        // the global candidate budget has to be *shared* between feeds, and a
+        // single flat vector turns "who gets the last slot" into a hash lottery
+        // where a second, smaller subscription can silently never get probed.
+        let mut lists: Vec<(String, Vec<subs::Node>)> = Vec::new();
         for s in cfg.subscriptions.iter() {
             if !s.enabled {
                 stats.push(SubStat {
@@ -461,10 +473,11 @@ impl App {
                     }
                     let mut proto_counts: Vec<(String, usize)> = hist.into_iter().collect();
                     proto_counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    let kept_n = kept.len();
                     eprintln!(
                         "[exitmap] 订阅 {} -> {} 个节点{}",
                         s.name,
-                        kept.len(),
+                        kept_n,
                         if filtered > 0 {
                             format!("（过滤掉 {filtered}）")
                         } else {
@@ -473,13 +486,20 @@ impl App {
                     );
                     stats.push(SubStat {
                         id: s.id.clone(),
-                        nodes: kept.len(),
+                        nodes: kept_n,
                         filtered,
                         proto_counts,
-                        ids: kept.iter().map(|n| n.id.clone()).collect(),
                         ..Default::default()
                     });
-                    nodes.extend(kept);
+                    let mut entry = kept;
+                    if s.quota > 0 && entry.len() > s.quota {
+                        // Rotate by the minute so the nodes that lose the quota
+                        // cut this round are the ones that get it next round.
+                        let off = (now_ms() / 60_000) as usize % entry.len();
+                        entry.rotate_left(off);
+                        entry.truncate(s.quota);
+                    }
+                    lists.push((s.id.clone(), entry));
                 }
                 Err(e) => {
                     errs.push(format!("{}: {e}", s.name));
@@ -492,9 +512,47 @@ impl App {
                 }
             }
         }
-        // Dedupe across subscriptions: the same node in two feeds is one exit.
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        nodes.dedup_by(|a, b| a.id == b.id);
+        // The same node in two feeds is one exit; the first feed that carries it
+        // gets the credit.
+        let mut seen: HashSet<String> = HashSet::new();
+        for (_, list) in lists.iter_mut() {
+            list.retain(|n| seen.insert(n.id.clone()));
+        }
+        // Share the budget round-robin, one candidate per feed per pass, so a
+        // 228-node feed and a 40-node feed split the cap instead of the big one
+        // taking all of it.
+        let cap = cfg.max_probe_nodes;
+        let mut picked: HashMap<String, Vec<String>> = HashMap::new();
+        let mut nodes: Vec<subs::Node> = Vec::new();
+        let mut round = 0usize;
+        'fill: loop {
+            let mut any = false;
+            for (id, list) in lists.iter() {
+                if round >= list.len() {
+                    continue;
+                }
+                any = true;
+                if cap > 0 && nodes.len() >= cap {
+                    break 'fill;
+                }
+                picked
+                    .entry(id.clone())
+                    .or_default()
+                    .push(list[round].id.clone());
+                nodes.push(list[round].clone());
+            }
+            if !any {
+                break;
+            }
+            round += 1;
+        }
+        for st in stats.iter_mut() {
+            let Some(p) = picked.get(&st.id) else {
+                continue;
+            };
+            st.unprobed = st.nodes.saturating_sub(p.len());
+            st.ids = p.clone();
+        }
         if nodes.is_empty() {
             if errs.is_empty() {
                 anyhow::bail!("没有启用的订阅");
@@ -594,13 +652,9 @@ impl App {
             || now - last_sub >= cfg.sub_fetch_minutes as i64 * 60_000;
         if sub_due {
             match self.fetch_all(&cfg).await {
-                Ok((mut nodes, stats)) => {
-                    if cfg.max_probe_nodes > 0 && nodes.len() > cfg.max_probe_nodes {
-                        // Round-robin the cut so no node is permanently ignored.
-                        let off = (now / 60_000) as usize % nodes.len();
-                        nodes.rotate_left(off);
-                        nodes.truncate(cfg.max_probe_nodes);
-                    }
+                Ok((nodes, stats)) => {
+                    // The candidate budget is already split fairly inside
+                    // fetch_all (per-feed quota, then round-robin).
                     let n = nodes.len();
                     {
                         let mut inner = self.inner.write().await;
@@ -1145,8 +1199,10 @@ async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
                 "enabled": s.enabled,
                 "protos": s.protos,
                 "exclude": s.exclude,
+                "quota": s.quota,
                 "nodes": if live { st.map(|x| x.nodes).unwrap_or(0) } else { 0 },
                 "filtered": if live { st.map(|x| x.filtered).unwrap_or(0) } else { 0 },
+                "unprobed": if live { st.map(|x| x.unprobed).unwrap_or(0) } else { 0 },
                 "protoCounts": if live {
                     st.map(|x| x.proto_counts.clone()).unwrap_or_default()
                 } else {
@@ -1278,6 +1334,7 @@ struct PatchSub {
     enabled: Option<bool>,
     protos: Option<Vec<String>>,
     exclude: Option<String>,
+    quota: Option<usize>,
 }
 
 /// Edit one subscription in place. The URL arrives empty far more often than
@@ -1337,6 +1394,12 @@ async fn api_patch_sub(
                 refetch = true;
             }
         }
+        if let Some(q) = body.quota {
+            if q != s.quota {
+                s.quota = q;
+                refetch = true;
+            }
+        }
     }
     if let Err(e) = save_config(&cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
@@ -1348,6 +1411,71 @@ async fn api_patch_sub(
         app.wake.notify_one();
     }
     Json(json!({"ok": true, "refetch": refetch})).into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct TrySub {
+    url: Option<String>,
+    protos: Option<Vec<String>>,
+    exclude: Option<String>,
+}
+
+/// Dry run: fetch a feed and report what the *pending* rules would keep, without
+/// touching the pool, the config, or writing anything to disk. Swapping a URL
+/// used to mean saving, waiting a minute, and reading the table; this answers in
+/// seconds and leaves no trace if the answer is "that link is dead".
+async fn api_try_sub(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(body): Json<TrySub>,
+) -> Response {
+    let stored = {
+        let cfg = app.cfg.read().await;
+        cfg.subscriptions.iter().find(|s| s.id == id).cloned()
+    };
+    let Some(stored) = stored else {
+        return (StatusCode::NOT_FOUND, "没有这条订阅").into_response();
+    };
+    let url = body
+        .url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or(stored.url.clone());
+    let rules = Sub {
+        protos: body.protos.unwrap_or(stored.protos),
+        exclude: body.exclude.unwrap_or(stored.exclude),
+        ..stored
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(25))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let text = match subs::fetch(&client, &url).await {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("拉不动: {e}")).into_response(),
+    };
+    let parsed = subs::parse_body(&text);
+    let total = parsed.len();
+    let kept: Vec<subs::Node> = parsed.into_iter().filter(|n| rules.keeps(n)).collect();
+    let mut hist: HashMap<String, usize> = HashMap::new();
+    for n in &kept {
+        *hist.entry(n.proto.clone()).or_insert(0) += 1;
+    }
+    let mut proto_counts: Vec<(String, usize)> = hist.into_iter().collect();
+    proto_counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let sample: Vec<String> = kept.iter().take(6).map(|n| n.name.clone()).collect();
+    Json(json!({
+        "ok": true,
+        "total": total,
+        "kept": kept.len(),
+        "filtered": total - kept.len(),
+        "protoCounts": proto_counts,
+        "sample": sample,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1890,6 +2018,7 @@ async fn main() -> Result<()> {
         .route("/api/state", get(api_state))
         .route("/api/subscriptions", post(api_add_sub))
         .route("/api/subscriptions/{id}", delete(api_del_sub).patch(api_patch_sub))
+        .route("/api/subscriptions/{id}/try", post(api_try_sub))
         .route("/api/exits/{slot}/pin", post(api_pin))
         .route("/api/exits/{port}/country", post(api_pin_country))
         .route("/api/exits/{port}/ping", post(api_ping))
