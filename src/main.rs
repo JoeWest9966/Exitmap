@@ -69,6 +69,13 @@ struct Sub {
     name: String,
     url: String,
     enabled: bool,
+    /// Protocols to keep. Empty = keep everything. A feed with 165 trojan and
+    /// 63 hysteria2 nodes spends two thirds of the probe budget on nodes that
+    /// never work; this is the switch that stops paying for them.
+    protos: Vec<String>,
+    /// Comma-separated keywords; a node whose name contains one is dropped.
+    /// Airlines pad feeds with "剩余流量" and "过期" rows that are never exits.
+    exclude: String,
 }
 
 impl Default for Sub {
@@ -78,7 +85,30 @@ impl Default for Sub {
             name: String::new(),
             url: String::new(),
             enabled: true,
+            protos: Vec::new(),
+            exclude: String::new(),
         }
+    }
+}
+
+impl Sub {
+    /// Does this node survive the subscription's own rules?
+    fn keeps(&self, n: &subs::Node) -> bool {
+        if !self.protos.is_empty()
+            && !self
+                .protos
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(&n.proto))
+        {
+            return false;
+        }
+        let name = n.name.to_lowercase();
+        !self
+            .exclude
+            .split([',', '，', '\n', ' '])
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .any(|k| name.contains(&k.to_lowercase()))
     }
 }
 
@@ -189,8 +219,19 @@ fn save_config(cfg: &Config) -> Result<()> {
 #[serde(rename_all = "camelCase")]
 struct SubStat {
     id: String,
+    /// Nodes that survived this subscription's own filter rules.
     nodes: usize,
+    /// Nodes the rules threw away — shown so a filter that is too greedy is
+    /// visible instead of just looking like a small feed.
+    filtered: usize,
+    /// Protocol histogram of the surviving nodes, biggest first.
+    proto_counts: Vec<(String, usize)>,
+    /// How many live exits currently come from this feed. Filled in by the
+    /// state handler, which is the only place that knows the pool.
+    used: usize,
     error: String,
+    #[serde(skip)]
+    ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -382,6 +423,7 @@ impl App {
                     id: s.id.clone(),
                     nodes: 0,
                     error: "已停用".into(),
+                    ..Default::default()
                 });
                 continue;
             }
@@ -394,16 +436,50 @@ impl App {
                             id: s.id.clone(),
                             nodes: 0,
                             error: "解析不出节点".into(),
+                            ..Default::default()
                         });
-                    } else {
-                        eprintln!("[exitmap] 订阅 {} -> {} 个节点", s.name, parsed.len());
+                        continue;
+                    }
+                    let total = parsed.len();
+                    let kept: Vec<subs::Node> =
+                        parsed.into_iter().filter(|n| s.keeps(n)).collect();
+                    let filtered = total - kept.len();
+                    if kept.is_empty() {
+                        errs.push(format!("{}: 过滤器把所有节点都杀光了", s.name));
                         stats.push(SubStat {
                             id: s.id.clone(),
-                            nodes: parsed.len(),
-                            error: String::new(),
+                            nodes: 0,
+                            filtered,
+                            error: "过滤后一个节点都不剩".into(),
+                            ..Default::default()
                         });
-                        nodes.extend(parsed);
+                        continue;
                     }
+                    let mut hist: HashMap<String, usize> = HashMap::new();
+                    for n in &kept {
+                        *hist.entry(n.proto.clone()).or_insert(0) += 1;
+                    }
+                    let mut proto_counts: Vec<(String, usize)> = hist.into_iter().collect();
+                    proto_counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    eprintln!(
+                        "[exitmap] 订阅 {} -> {} 个节点{}",
+                        s.name,
+                        kept.len(),
+                        if filtered > 0 {
+                            format!("（过滤掉 {filtered}）")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    stats.push(SubStat {
+                        id: s.id.clone(),
+                        nodes: kept.len(),
+                        filtered,
+                        proto_counts,
+                        ids: kept.iter().map(|n| n.id.clone()).collect(),
+                        ..Default::default()
+                    });
+                    nodes.extend(kept);
                 }
                 Err(e) => {
                     errs.push(format!("{}: {e}", s.name));
@@ -411,6 +487,7 @@ impl App {
                         id: s.id.clone(),
                         nodes: 0,
                         error: e.to_string(),
+                        ..Default::default()
                     });
                 }
             }
@@ -1037,13 +1114,50 @@ async fn api_state(State(app): State<Arc<App>>) -> Json<Value> {
         .iter()
         .map(|s| {
             let st = inner.sub_stats.iter().find(|x| x.id == s.id);
+            // A disabled feed keeps whatever stats it had when it was switched
+            // off — `fetch_all` bails before writing stats when nothing is
+            // enabled. Zero them here so a stopped feed never looks healthy.
+            let live = s.enabled && st.is_some();
+            // A node shows up in two feeds when both feeds carry it, so `used`
+            // can sum past the exit count. That is the honest number for "what
+            // is this subscription actually contributing".
+            let used = if live {
+                st.map(|x| {
+                    x.ids
+                        .iter()
+                        .filter(|id| {
+                            inner
+                                .pool
+                                .exits
+                                .iter()
+                                .any(|e| e.alive && &e.node_id == *id)
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+            } else {
+                0
+            };
             json!({
                 "id": s.id,
                 "name": s.name,
                 "urlMasked": mask_url(&s.url),
                 "enabled": s.enabled,
-                "nodes": st.map(|x| x.nodes).unwrap_or(0),
-                "error": st.map(|x| x.error.clone()).unwrap_or_default(),
+                "protos": s.protos,
+                "exclude": s.exclude,
+                "nodes": if live { st.map(|x| x.nodes).unwrap_or(0) } else { 0 },
+                "filtered": if live { st.map(|x| x.filtered).unwrap_or(0) } else { 0 },
+                "protoCounts": if live {
+                    st.map(|x| x.proto_counts.clone()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                "used": used,
+                "error": if s.enabled {
+                    st.map(|x| x.error.clone()).unwrap_or_default()
+                } else {
+                    "已停用".to_string()
+                },
             })
         })
         .collect();
@@ -1134,6 +1248,7 @@ async fn api_add_sub(State(app): State<Arc<App>>, Json(body): Json<AddSub>) -> R
             name,
             url,
             enabled: true,
+            ..Default::default()
         });
         if let Err(e) = save_config(&cfg) {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
@@ -1154,6 +1269,85 @@ async fn api_del_sub(State(app): State<Arc<App>>, Path(id): Path<String>) -> Res
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
     }
     (StatusCode::OK, "ok").into_response()
+}
+
+#[derive(Deserialize)]
+struct PatchSub {
+    name: Option<String>,
+    url: Option<String>,
+    enabled: Option<bool>,
+    protos: Option<Vec<String>>,
+    exclude: Option<String>,
+}
+
+/// Edit one subscription in place. The URL arrives empty far more often than
+/// not: it is a credential the panel never echoes back, so "leave it blank to
+/// keep the current one" is the only shape that does not leak it.
+async fn api_patch_sub(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchSub>,
+) -> Response {
+    let mut cfg = app.cfg.write().await;
+    // Whether the *feed* changed: a rename should not trigger a refetch, but a
+    // new URL or a new filter must, otherwise it sits idle until the 30-minute
+    // timer comes around.
+    let mut refetch = false;
+    {
+        let Some(s) = cfg.subscriptions.iter_mut().find(|s| s.id == id) else {
+            return (StatusCode::NOT_FOUND, "没有这条订阅").into_response();
+        };
+        if let Some(n) = body.name {
+            let n = n.trim();
+            if !n.is_empty() {
+                s.name = n.to_string();
+            }
+        }
+        if let Some(u) = body.url {
+            let u = u.trim();
+            if !u.is_empty() && u != s.url {
+                if !u.contains("://") {
+                    return (StatusCode::BAD_REQUEST, "订阅 URL 不合法").into_response();
+                }
+                s.url = u.to_string();
+                refetch = true;
+            }
+        }
+        if let Some(e) = body.enabled {
+            if e != s.enabled {
+                s.enabled = e;
+                refetch = true;
+            }
+        }
+        if let Some(p) = body.protos {
+            let p: Vec<String> = p
+                .into_iter()
+                .map(|x| x.trim().to_lowercase())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if p != s.protos {
+                s.protos = p;
+                refetch = true;
+            }
+        }
+        if let Some(x) = body.exclude {
+            let x = x.trim().to_string();
+            if x != s.exclude {
+                s.exclude = x;
+                refetch = true;
+            }
+        }
+    }
+    if let Err(e) = save_config(&cfg) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("写配置失败: {e}")).into_response();
+    }
+    if refetch {
+        // Cleared stamp = `cycle` refetches on the next tick (a few seconds),
+        // then re-probes, so the table reflects the new rules in about a minute.
+        app.inner.write().await.status.last_sub_fetch_ms = 0;
+        app.wake.notify_one();
+    }
+    Json(json!({"ok": true, "refetch": refetch})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1622,6 +1816,7 @@ async fn main() -> Result<()> {
                     name: "订阅".into(),
                     url: u,
                     enabled: true,
+                    ..Default::default()
                 });
             }
         }
@@ -1694,7 +1889,7 @@ async fn main() -> Result<()> {
         .fallback(spa_fallback)
         .route("/api/state", get(api_state))
         .route("/api/subscriptions", post(api_add_sub))
-        .route("/api/subscriptions/{id}", delete(api_del_sub))
+        .route("/api/subscriptions/{id}", delete(api_del_sub).patch(api_patch_sub))
         .route("/api/exits/{slot}/pin", post(api_pin))
         .route("/api/exits/{port}/country", post(api_pin_country))
         .route("/api/exits/{port}/ping", post(api_ping))

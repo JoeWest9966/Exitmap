@@ -128,7 +128,34 @@ ul.log .arrow{color:var(--mute)}
   text-overflow:ellipsis;white-space:nowrap}
 .sub-card .url{font-family:var(--mono);font-size:11px;color:var(--mute);margin-top:4px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sub-card .meta{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11.5px;color:var(--dim)}
+.sub-card .meta{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11.5px;color:var(--dim);flex-wrap:wrap}
+.sub-card .meta.sub{color:var(--mute);font-size:11px;margin-top:3px}
+/* 数量是这个卡的主菜：一眼能扫到，不是藏在 badge 里 */
+.sub-card .cnt{display:flex;align-items:baseline;gap:3px;font-size:10.5px;color:var(--mute);flex:none}
+.sub-card .cnt b{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink)}
+.sub-card .cnt b.zero{color:var(--bad)}
+.sub-card{cursor:context-menu}
+
+/* 右键菜单 */
+.ctx{position:fixed;left:0;top:0;z-index:75;min-width:172px;background:var(--panel3);
+  border:1px solid var(--line);border-radius:10px;padding:4px;
+  box-shadow:0 14px 40px rgba(0,0,0,.6);display:none}
+.ctx.on{display:block}
+.ctx .i{display:flex;width:100%;align-items:center;justify-content:space-between;gap:14px;
+  background:none;border:none;border-radius:7px;padding:6px 9px;font-size:12.5px;
+  text-align:left;color:var(--ink);cursor:pointer}
+.ctx .i:hover{background:var(--accent-soft);border-color:transparent}
+.ctx .i.danger{color:var(--bad)}
+.ctx .i.danger:hover{background:var(--bad-soft)}
+.ctx .i .k{color:var(--mute);font-size:11px}
+.ctx .sep{height:1px;background:var(--line);margin:4px 3px}
+
+/* 编辑订阅的表单行（不能用 .cc-row，那个会把内容全转大写） */
+.fr{display:flex;gap:9px;align-items:flex-start;margin-top:9px}
+.fr>label{width:46px;flex:none;color:var(--dim);font-size:12px;padding-top:6px}
+.fr>div,.fr>input{min-width:0;flex:1}
+.proto.on{border-color:var(--accent);background:var(--accent-soft);color:var(--ink)}
+.proto:not(.on){opacity:.55}
 .sub-card .x{background:none;border:none;color:var(--mute);cursor:pointer;font-size:15px;
   line-height:1;padding:0 2px;border-radius:5px}
 .sub-card .x:hover{color:var(--bad);background:var(--bad-soft)}
@@ -546,6 +573,28 @@ pre.snip{background:#0b0d11;border:1px solid var(--line);border-radius:9px;paddi
 
 <nav class="dock" id="dock" aria-label="页面切换"></nav>
 
+<div class="ctx" id="ctx" role="menu"></div>
+
+<div class="modal" id="sub-modal" aria-hidden="true">
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <b id="sub-title">编辑订阅</b><span class="grow"></span>
+      <button class="x" id="sub-close" title="关闭">×</button>
+    </div>
+    <div class="hint" id="sub-stat"></div>
+    <div class="fr"><label>名称</label><input id="sub-name" maxlength="40" autocomplete="off"></div>
+    <div class="fr"><label>链接</label><input id="sub-url" autocomplete="off" spellcheck="false"></div>
+    <div class="fr"><label>协议</label><div class="cc-grid" id="sub-protos" style="margin:0"></div></div>
+    <div class="fr"><label>排除</label><input id="sub-exclude" placeholder="节点名包含这些词就丢掉，逗号分隔，如 剩余流量,过期" autocomplete="off"></div>
+    <div class="modal-foot" style="gap:8px">
+      <button class="tiny" id="sub-del" style="color:var(--bad)">删除</button>
+      <span style="flex:1"></span>
+      <button class="tiny" id="sub-cancel">取消</button>
+      <button class="tiny primary" id="sub-save">保存</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal" id="cc-modal" aria-hidden="true">
   <div class="modal-card" role="dialog" aria-modal="true">
     <div class="modal-head">
@@ -834,15 +883,18 @@ function renderSubList(subs){
   box.innerHTML = subs.map(s => {
     const badge = s.error
       ? `<span class="badge off" title="${esc(s.error)}">${esc(s.error)}</span>`
-      : `<span class="badge on"><i class="dot"></i>${s.nodes} 节点</span>`;
+      : `<span class="badge ${s.used ? "on" : "off"}" title="这条订阅当前撑起几个出口"><i class="dot"></i>贡献 ${s.used || 0} 出口</span>`;
     const off = s.enabled ? "" : ` <span class="badge off">已停用</span>`;
-    return `<div class="sub-card">
+    const hist = (s.protoCounts || []).map(([p, n]) => `${esc(p)} ${n}`).join(" · ");
+    return `<div class="sub-card" data-sub="${esc(s.id)}">
       <div class="top">
         <span class="nm2" title="${esc(s.name)}">${esc(s.name)}</span>
+        <span class="cnt" title="这条订阅里通过过滤的节点数 / 正在撑起多少出口"><b class="${s.nodes ? "" : "zero"}">${s.nodes || 0}</b>节点</span>
         <button class="x" data-del="${esc(s.id)}" title="删除这条订阅">×</button>
       </div>
       <div class="url" title="${esc(s.urlMasked)}">${esc(s.urlMasked)}</div>
-      <div class="meta">${badge}${off}</div>
+      <div class="meta">${badge}${off}${s.filtered ? `<span class="badge" title="被协议/关键字规则丢掉的节点">过滤 ${s.filtered}</span>` : ""}</div>
+      ${hist ? `<div class="meta sub" title="通过过滤的节点按协议分布">${hist}</div>` : ""}
     </div>`;
   }).join("");
   box.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
@@ -850,7 +902,113 @@ function renderSubList(subs){
     try{ await api("/api/subscriptions/" + encodeURIComponent(b.dataset.del), {method:"DELETE"}); toast("已删除"); load(); }
     catch(e){ toast("删除失败: " + e.message); }
   });
+  // 右键菜单：手机上没右键，所以 × 保留着；两边走同一个处理函数。
+  const byId = new Map(subs.map(s => [s.id, s]));
+  box.querySelectorAll("[data-sub]").forEach(el => {
+    const s = byId.get(el.dataset.sub);
+    if(!s) return;
+    el.oncontextmenu = ev => openCtx(ev, subMenu(s));
+  });
 }
+
+// ── 右键菜单 ───────────────────────────────────────────────────────────────
+function closeCtx(){ const c = $("#ctx"); c.classList.remove("on"); c.innerHTML = ""; }
+function openCtx(ev, items){
+  ev.preventDefault();
+  ev.stopPropagation();
+  const c = $("#ctx");
+  c.innerHTML = items.map((it, i) => it.sep ? `<div class="sep"></div>`
+    : `<button class="i ${it.danger ? "danger" : ""}" data-i="${i}">${esc(it.label)}${it.hint ? `<span class="k">${esc(it.hint)}</span>` : ""}</button>`).join("");
+  c.classList.add("on");
+  // 贴边时往回翻，否则菜单会有一半在屏幕外。
+  const r = c.getBoundingClientRect();
+  let x = ev.clientX, y = ev.clientY;
+  if(x + r.width + 8 > innerWidth) x = innerWidth - r.width - 8;
+  if(y + r.height + 8 > innerHeight) y = innerHeight - r.height - 8;
+  c.style.left = Math.max(8, x) + "px";
+  c.style.top = Math.max(8, y) + "px";
+  c.querySelectorAll("[data-i]").forEach(b => b.onclick = () => {
+    const it = items[Number(b.dataset.i)];
+    closeCtx();
+    if(it.onpick) it.onpick();
+  });
+}
+document.addEventListener("click", ev => { if(!ev.target.closest("#ctx")) closeCtx(); });
+window.addEventListener("blur", closeCtx);
+document.addEventListener("keydown", ev => { if(ev.key === "Escape") closeCtx(); });
+
+function subMenu(s){
+  const on = !!s.enabled;
+  return [
+    {label:"编辑", hint:"名称 / 链接 / 过滤", onpick:() => openSubModal(s)},
+    {label: on ? "停用" : "启用", hint: on ? "不删，只不参与" : "", onpick:() => patchSub(s, {enabled: !on})},
+    {sep:true},
+    {label:"删除", hint:"不可撤销", danger:true, onpick:() => delSub(s)},
+  ];
+}
+
+async function patchSub(s, body){
+  try{
+    const r = await api("/api/subscriptions/" + encodeURIComponent(s.id), {
+      method:"PATCH", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
+    toast(r && r.refetch ? "已保存，正在重拉这一轮…" : "已保存");
+    setTimeout(load, r && r.refetch ? 2500 : 300);
+    return true;
+  }catch(e){ toast("保存失败: " + e.message); return false; }
+}
+
+async function delSub(s){
+  if(!confirm(`删掉订阅「${s.name}」？`)) return;
+  try{ await api("/api/subscriptions/" + encodeURIComponent(s.id), {method:"DELETE"}); toast("已删除"); load(); }
+  catch(e){ toast("删除失败: " + e.message); }
+}
+
+// ── 编辑订阅 ───────────────────────────────────────────────────────────────
+// URL 是凭据，永远不回显：留空 = 不改。其余字段都是「过滤手段」，改完立刻重拉一轮。
+let SUB_EDIT = null;
+function openSubModal(s){
+  SUB_EDIT = s;
+  $("#sub-title").textContent = "编辑订阅 · " + s.name;
+  $("#sub-stat").innerHTML = `通过过滤 <b>${s.nodes || 0}</b> 节点 · 当前贡献 <b>${s.used || 0}</b> 个出口`
+    + (s.filtered ? ` · 已过滤掉 <b>${s.filtered}</b>` : "");
+  $("#sub-name").value = s.name || "";
+  $("#sub-url").value = "";
+  $("#sub-url").placeholder = "留空 = 不换（URL 是凭据，不回显）";
+  $("#sub-exclude").value = s.exclude || "";
+  // 协议 chips：只列这条订阅里真出现过的，外加配置里已经选中的（可能是上一轮的手动项）
+  const have = new Map((s.protoCounts || []).map(([p, n]) => [String(p).toLowerCase(), n]));
+  const chosen = (s.protos || []).map(p => String(p).toLowerCase());
+  const list = [...new Set([...have.keys(), ...chosen])];
+  $("#sub-protos").innerHTML = list.length
+    ? list.map(p => `<button class="tiny proto ${chosen.length === 0 || chosen.includes(p) ? "on" : ""}" data-proto="${esc(p)}">${esc(p)}${have.has(p) ? ` ${have.get(p)}` : ""}</button>`).join("")
+        + `<span class="dim" style="font-size:11.5px;align-self:center">${chosen.length === 0 ? "全都要" : "只留点亮的"}</span>`
+    : `<span class="dim" style="font-size:11.5px">这条订阅还没拉到节点，协议清单要等下一轮</span>`;
+  $("#sub-protos").querySelectorAll("[data-proto]").forEach(b => b.onclick = () => b.classList.toggle("on"));
+  $("#sub-modal").classList.add("on");
+  $("#sub-name").focus();
+}
+function closeSubModal(){ $("#sub-modal").classList.remove("on"); SUB_EDIT = null; }
+$("#sub-close").onclick = closeSubModal;
+$("#sub-cancel").onclick = closeSubModal;
+$("#sub-modal").addEventListener("click", ev => { if(ev.target === $("#sub-modal")) closeSubModal(); });
+$("#sub-del").onclick = () => { if(SUB_EDIT) delSub(SUB_EDIT); closeSubModal(); };
+$("#sub-save").onclick = async () => {
+  if(!SUB_EDIT) return;
+  const chips = [...document.querySelectorAll("#sub-protos [data-proto]")];
+  const on = chips.filter(b => b.classList.contains("on")).map(b => b.dataset.proto);
+  // 一个协议都不留等于把这条订阅整条杀掉，但后端把「空名单」当作「全都要」——
+  // 两种意思撞车，所以干脆不给保存。
+  if(chips.length && !on.length){ toast("至少留一个协议；整条不要就停用它"); return; }
+  // 全亮 = 空数组 = 不限协议，免得配置里堆一串等价于默认的名单
+  const protos = chips.length && on.length === chips.length ? [] : on;
+  const ok = await patchSub(SUB_EDIT, {
+    name: $("#sub-name").value.trim(),
+    url: $("#sub-url").value.trim(),
+    exclude: $("#sub-exclude").value.trim(),
+    protos,
+  });
+  if(ok) closeSubModal();
+};
 
 function renderLog(log){
   const ul = $("#log");
