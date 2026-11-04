@@ -50,6 +50,12 @@ button:hover{border-color:rgba(110,123,255,.55)}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 button.primary:hover{filter:brightness(1.08)}
 button.tiny{padding:2px 9px;font-size:12px;border-radius:7px}
+/* 手动测速的结果要留得住：表的 5 秒轮询会重绘整行，所以状态放在 PING 里，
+   按下后按钮原地变成数字，直到超时才变回 ping。 */
+button.tiny.ping-ok{border-color:rgba(63,221,139,.42);color:var(--ok)}
+button.tiny.ping-warn{border-color:rgba(245,181,68,.42);color:var(--warn)}
+button.tiny.ping-bad{border-color:rgba(248,122,122,.42);color:var(--bad)}
+button.tiny.ping-wait{color:var(--mute)}
 button:disabled{opacity:.45;cursor:default}
 
 main{max-width:1180px;margin:0 auto;padding:22px 22px calc(var(--dock-h) + 40px)}
@@ -691,7 +697,8 @@ function renderExits(exits){
       : '<span class="badge off"><i class="dot"></i>端口关闭</span>';
     const actions = ph
       ? `<button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button>`
-      : `<button class="tiny" data-copy="${e.port}">复制</button>
+      : `<button class="tiny ${pingCls(e.port)}" data-ping="${e.port}" title="点一下实测这个出口的延迟，不改排序">${pingText(e.port)}</button>
+          <button class="tiny" data-copy="${e.port}">复制</button>
           <button class="tiny" data-pin="${e.slot}" data-to="${e.pinned ? "false" : "true"}">${e.pinned ? "解锁" : "钉住"}</button>
           <button class="tiny" data-cc="${e.port}" data-cur="${esc(e.slotCountry || "")}">国家</button>`;
     return `<tr class="${ph ? "ph" : ""}">
@@ -705,6 +712,7 @@ function renderExits(exits){
       <td>${actions}</td>
     </tr>`;
   }).join("");
+  tb.querySelectorAll("[data-ping]").forEach(b => b.onclick = () => pingExit(Number(b.dataset.ping)));
   tb.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
     const addr = "127.0.0.1:" + b.dataset.copy;
     const ok = await copyText(addr);
@@ -721,6 +729,44 @@ function renderExits(exits){
   });
   tb.querySelectorAll("[data-cc]").forEach(b => b.onclick = () =>
     openCountryModal(Number(b.dataset.cc), b.dataset.cur, LAST_EXITS));
+}
+
+// ── 手动测速 ───────────────────────────────────────────────────────────────
+// 结果留在 PING 里而不是 DOM 里：整表每 5 秒重绘一次，写在 DOM 上的数字活不过
+// 一次轮询。只记账，不进 pool —— 点按钮不该把排序拨动一下。
+let PING = {};
+const PING_TTL = 5 * 60 * 1000;
+
+function pingText(port){
+  const p = PING[port];
+  if(!p || (!p.pending && Date.now() - p.at > PING_TTL)) return "ping";
+  if(p.pending) return "…";
+  if(!p.ok) return "超时";
+  return p.ms + "ms";
+}
+function pingCls(port){
+  const p = PING[port];
+  if(!p || (!p.pending && Date.now() - p.at > PING_TTL)) return "";
+  if(p.pending) return "ping-wait";
+  if(!p.ok) return "ping-bad";
+  return p.changed ? "ping-warn" : "ping-ok";
+}
+
+async function pingExit(port){
+  if(PING[port] && PING[port].pending) return;
+  PING[port] = {pending:true, at:Date.now()};
+  renderExits(LAST_EXITS);          // 立刻把按钮变成 …
+  try{
+    const r = await api(`/api/exits/${port}/ping`, {method:"POST"});
+    PING[port] = {ok:true, ms:r.ms, ip:r.ip, changed:!!r.changed, at:Date.now()};
+    toast(r.changed
+      ? `${port}: ${r.ms}ms，但出口 IP 已经换成 ${r.ip} 了`
+      : `${port}: ${r.ms}ms`);
+  }catch(e){
+    PING[port] = {ok:false, at:Date.now()};
+    toast(`${port}: ${e.message || "测速失败"}`);
+  }
+  renderExits(LAST_EXITS);
 }
 
 // ── 端口固定国家 ─────────────────────────────────────────────────────────

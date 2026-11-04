@@ -1175,6 +1175,41 @@ async fn api_pin(State(app): State<Arc<App>>, Path(slot): Path<usize>, Json(body
     (StatusCode::OK, "ok").into_response()
 }
 
+/// Manual latency check for one exit. Deliberately does *not* touch the pool: a
+/// click must not nudge `latency_ms`, `lat_ema` or trigger a re-sort — ranking
+/// moves on its own schedule, not on how often you press a button.
+async fn api_ping(State(app): State<Arc<App>>, Path(port): Path<u16>) -> Response {
+    let (probe_url, timeout_ms, cur_ip) = {
+        let inner = app.inner.read().await;
+        let cfg = app.cfg.read().await;
+        match inner.pool.exits.iter().find(|e| e.port == port) {
+            None => return (StatusCode::NOT_FOUND, "这个端口上没有出口").into_response(),
+            Some(e) if !e.alive => {
+                return (StatusCode::CONFLICT, "这个端口现在是关着的").into_response()
+            }
+            Some(e) => (cfg.probe_url.clone(), cfg.probe_timeout_ms, e.ip.clone()),
+        }
+    };
+    let timeout = Duration::from_millis(timeout_ms.clamp(1000, 20_000));
+    let started = Instant::now();
+    match probe::egress_ip(port, &probe_url, timeout).await {
+        Some((ip, _)) => Json(json!({
+            "ok": true,
+            // timed from here, not from inside egress_ip: the question the
+            // button answers is "how long until I get an answer".
+            "ms": started.elapsed().as_millis() as u64,
+            "ip": ip,
+            "changed": ip != cur_ip,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "超时：这个出口没在时限内回应",
+        )
+            .into_response(),
+    }
+}
+
 async fn api_refresh(State(app): State<Arc<App>>) -> Response {
     // Refuse while a round is in flight. The wake permit is sticky, so a click
     // during a round costs a whole extra minute of probing for nothing — that
@@ -1662,6 +1697,7 @@ async fn main() -> Result<()> {
         .route("/api/subscriptions/{id}", delete(api_del_sub))
         .route("/api/exits/{slot}/pin", post(api_pin))
         .route("/api/exits/{port}/country", post(api_pin_country))
+        .route("/api/exits/{port}/ping", post(api_ping))
         .route("/api/refresh", post(api_refresh))
         .route("/api/config", get(api_config).patch(api_patch_config))
         .route("/api/diag/ports", post(api_diag_ports))
